@@ -2,6 +2,7 @@
 User-accessible slash commands (available in any channel, usable by anyone):
   /reset-request      — delete current onboarding channel and start fresh
   /retry-application  — re-ping country officials for a pending embassy approval
+  /request-write      — request write access in your country's embassy channel
 """
 
 import logging
@@ -120,6 +121,78 @@ class UserCommandsCog(commands.Cog, name='UserCommandsCog'):
         )
         await interaction.response.send_message(
             f'✅ Re-pinged your country\'s officials in {embassy_channel.mention}.', ephemeral=True
+        )
+
+
+    # ── /request-write ────────────────────────────────────────────────────────
+
+    @app_commands.command(
+        name='request-write',
+        description='Request write access in your country\'s embassy channel.'
+    )
+    async def request_write(self, interaction: discord.Interaction):
+        guild = interaction.guild
+        member = interaction.user
+
+        # Must be a tracked embassy member
+        tracked = await self.bot.db.get_tracked_user(str(member.id), str(guild.id))
+        if not tracked or tracked.get('assigned_role') != 'embassy':
+            await interaction.response.send_message(
+                'This command is only available to embassy members.', ephemeral=True
+            )
+            return
+
+        embassy_req = await self.bot.db.get_embassy_request(str(member.id), str(guild.id))
+        if not embassy_req:
+            await interaction.response.send_message(
+                'No embassy record found for your account.', ephemeral=True
+            )
+            return
+
+        # Must not already have write access
+        if embassy_req.get('access_level') == 'write':
+            await interaction.response.send_message(
+                'You already have write access in your embassy channel.', ephemeral=True
+            )
+            return
+
+        embassy_channel_id = embassy_req.get('embassy_channel_id')
+        if not embassy_channel_id:
+            await interaction.response.send_message(
+                'Embassy channel not found. Please contact an admin.', ephemeral=True
+            )
+            return
+
+        embassy_channel = guild.get_channel(int(embassy_channel_id))
+        if not embassy_channel:
+            await interaction.response.send_message(
+                'Embassy channel no longer exists. Please contact an admin.', ephemeral=True
+            )
+            return
+
+        # Find write-level officials of the same country
+        cog = self.bot.get_cog('OnboardingCog')
+        officials = []
+        if cog:
+            officials = await cog._find_country_officials(guild, embassy_req.get('country_id'))
+
+        if not officials:
+            await interaction.response.send_message(
+                '⚠️ No officials from your country are currently registered in this Discord.\n'
+                'Try again later when an official has joined.',
+                ephemeral=True
+            )
+            return
+
+        official_mentions = ' '.join(o.mention for o in officials)
+        await embassy_channel.send(
+            f'✏️ **Write access request:** {member.mention} is requesting write access in this channel.\n'
+            f'Officials: {official_mentions}\n'
+            f'Use `/addwrite` to grant access.'
+        )
+        await interaction.response.send_message(
+            f'✅ Your request has been sent to your country\'s officials in {embassy_channel.mention}.',
+            ephemeral=True
         )
 
 

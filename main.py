@@ -37,6 +37,7 @@ class CongoBot(commands.Bot):
         await self.load_extension('cogs.scheduler')
         await self.load_extension('cogs.admin')
         await self.load_extension('cogs.user_commands')
+        await self.load_extension('cogs.tracker')
 
         guild_obj = discord.Object(id=self.guild_id)
         self.tree.copy_global_to(guild=guild_obj)
@@ -51,6 +52,12 @@ class CongoBot(commands.Bot):
         log.info(f'Logged in as {self.user} (ID: {self.user.id})')
         await self.change_presence(activity=discord.Game(name='Guarding Congo 🇨🇬'))
         await self._seed_guild_config()
+        # Apply stored API key so all warera_api calls use it immediately
+        config = await self.db.get_guild_config(str(self.guild_id))
+        if config and config.get('warera_api_key'):
+            from warera_api import set_api_key
+            set_api_key(config['warera_api_key'])
+            log.info('WarEra API key loaded from guild config')
 
     async def _seed_guild_config(self):
         """
@@ -71,6 +78,8 @@ class CongoBot(commands.Bot):
             'local_role_economy_id':        os.getenv('SETUP_LOCAL_ROLE_ECONOMY_ID'),
             'local_role_defense_id':        os.getenv('SETUP_LOCAL_ROLE_DEFENSE_ID'),
             'local_role_congress_id':       os.getenv('SETUP_LOCAL_ROLE_CONGRESS_ID'),
+            'elders_role_id':               os.getenv('SETUP_ELDERS_ROLE_ID'),
+            'warera_api_key':               os.getenv('WARERA_API_KEY'),
         }
         # Drop empty/unset entries
         seed = {k: v for k, v in seed.items() if v}

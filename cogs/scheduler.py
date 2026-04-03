@@ -13,7 +13,7 @@ import discord
 from discord.ext import commands, tasks
 
 from country_flags import get_flag
-from warera_api import get_user_lite, get_government_role, role_display_name, get_country_by_id, CONGO_LOCAL_ROLES
+from warera_api import get_user_lite, get_government_role, role_display_name, get_country_by_id, CONGO_LOCAL_ROLES, batch_get_user_lite
 
 log = logging.getLogger(__name__)
 
@@ -27,6 +27,7 @@ class SchedulerCog(commands.Cog, name='SchedulerCog'):
         self.check_company_names.start()
         self.check_scheduled_deletions.start()
         self.check_inactivity.start()
+        self.check_reverification_inactivity.start()
         self.daily_role_audit.start()
         self.daily_backup.start()
 
@@ -34,6 +35,7 @@ class SchedulerCog(commands.Cog, name='SchedulerCog'):
         self.check_company_names.cancel()
         self.check_scheduled_deletions.cancel()
         self.check_inactivity.cancel()
+        self.check_reverification_inactivity.cancel()
         self.daily_role_audit.cancel()
         self.daily_backup.cancel()
 
@@ -144,6 +146,70 @@ class SchedulerCog(commands.Cog, name='SchedulerCog'):
     async def before_inactivity_check(self):
         await self.bot.wait_until_ready()
 
+    # ── Task: re-verification deadline / warning checks ──────────────────────
+
+    @tasks.loop(hours=1)
+    async def check_reverification_inactivity(self):
+        guild = self.bot.get_guild(self.bot.guild_id)
+        if not guild:
+            return
+        onboarding = self._get_onboarding()
+        pending = await self.bot.db.get_all_pending_reverifications(str(guild.id))
+        for rev in pending:
+            req = await self.bot.db.get_user_request(rev['discord_id'], str(guild.id))
+            if not req or req.get('status') == 'completed':
+                await self.bot.db.delete_reverification(rev['discord_id'], str(guild.id))
+                continue
+            member = guild.get_member(int(rev['discord_id']))
+            if not member:
+                await self.bot.db.delete_reverification(rev['discord_id'], str(guild.id))
+                await self.bot.db.delete_user_request(rev['discord_id'], str(guild.id))
+                continue
+            channel = guild.get_channel(int(req['channel_id'])) if req.get('channel_id') else None
+            try:
+                created_at = datetime.fromisoformat(req['created_at'])
+            except (ValueError, TypeError):
+                continue
+            days_elapsed = (datetime.utcnow() - created_at).days
+
+            # Fail at 21 days
+            if days_elapsed >= 21:
+                if channel:
+                    try:
+                        await channel.send(
+                            f'{member.mention} ⏰ Re-verification deadline has passed. '
+                            'Your access will now be revoked.'
+                        )
+                    except discord.Forbidden:
+                        pass
+                if onboarding:
+                    await onboarding._fail_reverification(channel, member)
+                continue
+
+            # Warn every 7 days and send a final warning at day 20
+            warn_count = rev.get('warn_count') or 0
+            last_warned_str = rev.get('last_warned_at')
+            last_warned = datetime.fromisoformat(last_warned_str) if last_warned_str else created_at
+            days_since_warn = (datetime.utcnow() - last_warned).days
+            final_warning = days_elapsed >= 20 and warn_count < (days_elapsed // 7 + 1)
+            if days_since_warn >= 7 or final_warning:
+                days_left = 21 - days_elapsed
+                urgency = '🚨 **FINAL WARNING** — ' if days_elapsed >= 20 else '⚠️ '
+                if channel:
+                    try:
+                        await channel.send(
+                            f'{member.mention} {urgency}Re-verification reminder: '
+                            f'**{days_left} day(s) remaining**.\n'
+                            'Complete your verification to keep your access.'
+                        )
+                    except discord.Forbidden:
+                        pass
+                await self.bot.db.update_reverification_warn(rev['discord_id'], str(guild.id))
+
+    @check_reverification_inactivity.before_loop
+    async def before_reverification_check(self):
+        await self.bot.wait_until_ready()
+
     # ── Task: daily role audit at 07:00 UTC ──────────────────────────────────
 
     @tasks.loop(hours=1)
@@ -159,73 +225,7 @@ class SchedulerCog(commands.Cog, name='SchedulerCog'):
         if not guild:
             return
 
-        config = await self.bot.db.get_guild_config(str(guild.id))
-        tracked = await self.bot.db.get_all_tracked_users(str(guild.id))
-        log.info(f'Daily role audit: checking {len(tracked)} tracked users')
-
-        for t in tracked:
-            member = guild.get_member(int(t['discord_id']))
-            if not member:
-                continue
-
-            warera_data = await get_user_lite(t['warera_id'])
-            if not warera_data:
-                continue
-
-            assigned = t.get('assigned_role')
-
-            if assigned == 'citizen':
-                if warera_data.get('country') != CONGO_COUNTRY_ID:
-                    log.info(f'Downgrading {member} from citizen (no longer Congo)')
-                    await self._downgrade_to_visitor(guild, member, t, config, warera_data)
-                else:
-                    # Citizen still qualifies — sync their local Congo government roles
-                    onboarding = self._get_onboarding()
-                    if onboarding:
-                        await onboarding.sync_congo_local_roles(guild, member, warera_data, config)
-
-            elif assigned == 'visitor':
-                infos = warera_data.get('infos', {})
-                role_field, access_level, _ = get_government_role(infos)
-                if role_field and access_level:
-                    await self._notify_upgrade_available(member, role_field)
-
-            elif assigned == 'embassy':
-                infos = warera_data.get('infos', {})
-                role_field, access_level, warera_role = get_government_role(infos)
-                current_country = warera_data.get('country')
-                country_changed = bool(current_country and current_country != t.get('country_id'))
-                # Congolese embassy members also get the Citizen role + government roles
-                if current_country == CONGO_COUNTRY_ID:
-                    citizen_role_id = config.get('citizen_role_id') if config else None
-                    if citizen_role_id:
-                        citizen_role = guild.get_role(int(citizen_role_id))
-                        if citizen_role and citizen_role not in member.roles:
-                            try:
-                                await member.add_roles(citizen_role)
-                            except discord.Forbidden:
-                                pass
-                    onboarding = self._get_onboarding()
-                    if onboarding:
-                        await onboarding.sync_congo_local_roles(guild, member, warera_data, config)
-                if not role_field:
-                    log.info(f'Downgrading {member} from embassy (lost government role)')
-                    await self._downgrade_to_visitor(guild, member, t, config, warera_data)
-                elif country_changed:
-                    log.info(f'Switching {member} embassy: {t.get("country_id")} → {current_country}')
-                    await self._switch_embassy(guild, member, t, config, warera_data, current_country, access_level, warera_role)
-                elif access_level != 'write':
-                    # Only revoke write role if it wasn't granted to them by another official
-                    grants_received = await self.bot.db.get_write_grants_by_grantee(
-                        str(t['discord_id']), str(guild.id)
-                    )
-                    if not grants_received:
-                        await self._revoke_write_role_if_held(guild, member, str(t['discord_id']))
-                    # Still revoke any write grants they themselves made
-                    await self._revoke_grants_by_grantor(guild, str(t['discord_id']))
-
-        # Check all write grants — revoke if the grantor no longer has a write-level role
-        await self._audit_write_grants(guild)
+        await self._run_audit(guild)
 
     @daily_role_audit.before_loop
     async def before_daily_audit(self):
@@ -366,11 +366,14 @@ class SchedulerCog(commands.Cog, name='SchedulerCog'):
                 except discord.Forbidden:
                     pass
 
-    async def _revoke_grants_by_grantor(self, guild: discord.Guild, grantor_discord_id: str):
+    async def _revoke_grants_by_grantor(
+        self, guild: discord.Guild, grantor_discord_id: str, reason: str = None
+    ):
         """Revoke all write grants made by this grantor."""
         grants = await self.bot.db.remove_all_write_grants_by_grantor(
             grantor_discord_id, str(guild.id)
         )
+        default_reason = reason or 'the official who granted it is no longer in a qualifying government role'
         for grant in grants:
             grantee = guild.get_member(int(grant['grantee_discord_id']))
             if not grantee:
@@ -379,30 +382,135 @@ class SchedulerCog(commands.Cog, name='SchedulerCog'):
             if write_role and write_role in grantee.roles:
                 try:
                     await grantee.remove_roles(
-                        write_role, reason='Grantor lost write-level government role'
+                        write_role, reason=f'Write grant revoked: {default_reason}'
                     )
                 except discord.Forbidden:
                     pass
                 try:
                     await grantee.send(
-                        '⚠️ Your **write access** in an embassy has been revoked because '
-                        'the official who granted it is no longer in a qualifying government role.'
+                        f'⚠️ Your **write access** in an embassy has been revoked because '
+                        f'{default_reason}.'
                     )
                 except discord.Forbidden:
                     pass
 
-    async def _audit_write_grants(self, guild: discord.Guild):
-        """Check all write grants and revoke any where the grantor lost their write-level role."""
-        grants = await self.bot.db.get_all_write_grants(str(guild.id))
-        for grant in grants:
-            warera_data = await get_user_lite(grant['grantor_warera_id'])
+    async def _run_audit(self, guild: discord.Guild):
+        """Core of the daily role audit — usable by the scheduler and admin commands."""
+        config = await self.bot.db.get_guild_config(str(guild.id))
+        tracked = await self.bot.db.get_all_tracked_users(str(guild.id))
+        log.info(f'Role audit: checking {len(tracked)} tracked users')
+
+        # Pre-fetch all WarEra data in batch to minimise HTTP calls
+        all_warera_ids = [t['warera_id'] for t in tracked]
+        warera_results = await batch_get_user_lite(all_warera_ids)
+        warera_map = {uid: data for uid, data in zip(all_warera_ids, warera_results) if data}
+
+        for t in tracked:
+            member = guild.get_member(int(t['discord_id']))
+            if not member:
+                continue
+
+            warera_data = warera_map.get(t['warera_id'])
             if not warera_data:
                 continue
-            infos = warera_data.get('infos', {})
-            _, access_level, _ = get_government_role(infos)
-            if access_level != 'write':
-                log.info(f'Revoking write grant: grantor {grant["grantor_discord_id"]} lost write role')
-                await self._revoke_grants_by_grantor(guild, grant['grantor_discord_id'])
+
+            assigned = t.get('assigned_role')
+
+            if assigned == 'citizen':
+                if warera_data.get('country') != CONGO_COUNTRY_ID:
+                    log.info(f'Downgrading {member} from citizen (no longer Congo)')
+                    await self._downgrade_to_visitor(guild, member, t, config, warera_data)
+                else:
+                    onboarding = self._get_onboarding()
+                    if onboarding:
+                        await onboarding.sync_congo_local_roles(guild, member, warera_data, config)
+
+            elif assigned == 'visitor':
+                infos = warera_data.get('infos', {})
+                role_field, access_level, _ = get_government_role(infos)
+                if role_field and access_level:
+                    await self._notify_upgrade_available(member, role_field)
+
+            elif assigned == 'embassy':
+                infos = warera_data.get('infos', {})
+                role_field, access_level, warera_role = get_government_role(infos)
+                current_country = warera_data.get('country')
+                country_changed = bool(current_country and current_country != t.get('country_id'))
+                if current_country == CONGO_COUNTRY_ID:
+                    citizen_role_id = config.get('citizen_role_id') if config else None
+                    if citizen_role_id:
+                        citizen_role = guild.get_role(int(citizen_role_id))
+                        if citizen_role and citizen_role not in member.roles:
+                            try:
+                                await member.add_roles(citizen_role)
+                            except discord.Forbidden:
+                                pass
+                    onboarding = self._get_onboarding()
+                    if onboarding:
+                        await onboarding.sync_congo_local_roles(guild, member, warera_data, config)
+                if not role_field:
+                    log.info(f'Downgrading {member} from embassy (lost government role)')
+                    await self._downgrade_to_visitor(guild, member, t, config, warera_data)
+                elif country_changed:
+                    log.info(f'Switching {member} embassy: {t.get("country_id")} → {current_country}')
+                    await self._switch_embassy(guild, member, t, config, warera_data, current_country, access_level, warera_role)
+                elif access_level != 'write':
+                    grants_received = await self.bot.db.get_write_grants_by_grantee(
+                        str(t['discord_id']), str(guild.id)
+                    )
+                    if not grants_received:
+                        await self._revoke_write_role_if_held(guild, member, str(t['discord_id']))
+                    await self._revoke_grants_by_grantor(guild, str(t['discord_id']))
+
+        await self._audit_write_grants(guild)
+
+    async def _audit_write_grants(self, guild: discord.Guild):
+        """Check all write grants and revoke any where the grantor lost their qualifying role."""
+        grants = await self.bot.db.get_all_write_grants(str(guild.id))
+
+        # Pre-load the Senate role once
+        config = await self.bot.db.get_guild_config(str(guild.id))
+        senate_role = None
+        if config and config.get('senate_role_id'):
+            senate_role = guild.get_role(int(config['senate_role_id']))
+
+        # Batch-fetch WarEra data for all non-senate grantors up front
+        non_senate_grants = [g for g in grants if g.get('grant_type') != 'senate']
+        grantor_ids = [g['grantor_warera_id'] for g in non_senate_grants]
+        fetched = await batch_get_user_lite(grantor_ids)
+        warera_map = {uid: data for uid, data in zip(grantor_ids, fetched) if data}
+
+        for grant in grants:
+            if grant.get('grant_type') == 'senate':
+                # Senate grant: check that the grantor still holds the Senate role
+                grantor_member = guild.get_member(int(grant['grantor_discord_id']))
+                still_senate = (
+                    grantor_member is not None
+                    and senate_role is not None
+                    and senate_role in grantor_member.roles
+                )
+                if not still_senate:
+                    log.info(
+                        f'Revoking senate write grant: grantor {grant["grantor_discord_id"]} '
+                        'lost Senate role'
+                    )
+                    await self._revoke_grants_by_grantor(
+                        guild, grant['grantor_discord_id'],
+                        reason='the senator who guaranteed it is no longer in the Senate'
+                    )
+            else:
+                # Official grant: check WarEra write-level role
+                warera_data = warera_map.get(grant['grantor_warera_id'])
+                if not warera_data:
+                    continue
+                infos = warera_data.get('infos', {})
+                _, access_level, _ = get_government_role(infos)
+                if access_level != 'write':
+                    log.info(
+                        f'Revoking official write grant: grantor {grant["grantor_discord_id"]} '
+                        'lost write-level government role'
+                    )
+                    await self._revoke_grants_by_grantor(guild, grant['grantor_discord_id'])
 
     async def _notify_upgrade_available(self, member: discord.Member, role_field: str):
         try:

@@ -11,6 +11,7 @@ States stored in user_requests.status:
   rejected                 → explicitly rejected / kicked
 """
 
+import json
 import logging
 import random
 import re
@@ -393,6 +394,10 @@ class OnboardingCog(commands.Cog, name='OnboardingCog'):
             await self.start_citizen(channel, member, warera_data)
         elif role == 'embassy':
             await self.start_embassy(channel, member, warera_data)
+        elif role == 'reverify_embassy':
+            await self.start_embassy(channel, member, warera_data)
+        elif role == 'reverify_government':
+            await self.start_reverify_government(channel, member, warera_data)
 
     # ── Visitor path ──────────────────────────────────────────────────────────
 
@@ -654,6 +659,15 @@ class OnboardingCog(commands.Cog, name='OnboardingCog'):
         guild = channel.guild
         config = await self.bot.db.get_guild_config(str(guild.id))
 
+        # For re-verification flows: fail immediately instead of the normal no-role UI
+        request = await self.bot.db.get_user_request(str(member.id), str(guild.id))
+        if request and request.get('requested_role') in ('reverify_embassy', 'reverify_government'):
+            await channel.send(
+                f'{member.mention} ❌ No government role detected in WarEra — your access will be revoked.'
+            )
+            await self._fail_reverification(channel, member)
+            return
+
         # Set as visitor first
         await self.complete_visitor(channel, member, warera_data)
 
@@ -731,6 +745,108 @@ class OnboardingCog(commands.Cog, name='OnboardingCog'):
 
     # ── Company verification check ────────────────────────────────────────────
 
+    # ── Re-verification helpers ───────────────────────────────────────────────
+
+    async def start_reverify_government(self, channel: discord.TextChannel,
+                                         member: discord.Member, warera_data: dict):
+        """Start the company-rename step for a government re-verification."""
+        guild = channel.guild
+        infos = warera_data.get('infos', {})
+        role_field, _, _ = get_government_role(infos)
+        if not role_field:
+            await channel.send(
+                f'{member.mention} ❌ No congress or government role detected in WarEra. '
+                'Your access will be revoked.'
+            )
+            await self._fail_reverification(channel, member)
+            return
+
+        company_names = await get_company_names(warera_data['_id'])
+        token = _generate_token(company_names)
+        await self.bot.db.update_user_request(
+            str(member.id), str(guild.id),
+            verification_token=token, status='awaiting_company_change'
+        )
+        embed = discord.Embed(
+            title='🏛️ Government Role Verification',
+            description=(
+                f'Detected role: **{role_display_name(role_field)}**\n\n'
+                'To verify your identity, rename one of your companies in WarEra to:\n\n'
+                f'# `{token}`\n\n'
+                'The bot checks every minute automatically.\n'
+                'You can also send any message here to trigger an immediate check.\n\n'
+                '⚠️ The name must match exactly (case-insensitive).'
+            ),
+            color=discord.Color.blue()
+        )
+        await channel.send(embed=embed)
+
+    async def complete_government_reverify(self, channel: discord.TextChannel,
+                                            member: discord.Member):
+        """Complete a government re-verification — confirms the member, keeps their roles."""
+        guild = channel.guild
+        request = await self.bot.db.get_user_request(str(member.id), str(guild.id))
+        if not request:
+            return
+        await self.bot.db.update_user_request(
+            str(member.id), str(guild.id),
+            status='completed', completed_at=datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')
+        )
+        # Track them if not already tracked
+        if request.get('warera_id'):
+            await self.bot.db.upsert_tracked_user(
+                str(member.id), str(guild.id),
+                request['warera_id'], 'citizen',
+                request.get('country_id'), None
+            )
+        await self.bot.db.delete_reverification(str(member.id), str(guild.id))
+        await self._schedule_deletion(channel)
+        embed = discord.Embed(
+            title='✅ Government Role Verified!',
+            description=(
+                f'Thank you, {member.mention}! Your government role has been confirmed.\n\n'
+                f'This channel will be deleted in {CHANNEL_DELETE_HOURS} hour(s).'
+            ),
+            color=discord.Color.green()
+        )
+        await channel.send(embed=embed)
+
+    async def _fail_reverification(self, channel: discord.TextChannel, member: discord.Member):
+        """Strip roles, give visitor, clean up — used when re-verification fails or times out."""
+        guild = channel.guild
+        config = await self.bot.db.get_guild_config(str(guild.id))
+        rev = await self.bot.db.get_reverification(str(member.id), str(guild.id))
+        if rev:
+            for role_id in json.loads(rev['roles_to_remove']):
+                role = guild.get_role(int(role_id))
+                if role and role in member.roles:
+                    try:
+                        await member.remove_roles(role, reason='Re-verification failed')
+                    except discord.Forbidden:
+                        pass
+        visitor_role_id = config.get('visitor_role_id') if config else None
+        if visitor_role_id:
+            vr = guild.get_role(int(visitor_role_id))
+            if vr and vr not in member.roles:
+                try:
+                    await member.add_roles(vr, reason='Re-verification failed — downgraded to Visitor')
+                except discord.Forbidden:
+                    pass
+        try:
+            await member.send(
+                '⚠️ Your embassy/government access has been removed because you did not '
+                'complete re-verification in time. You have been given the **Visitor** role.'
+            )
+        except discord.Forbidden:
+            pass
+        await self.bot.db.delete_user_request(str(member.id), str(guild.id))
+        await self.bot.db.delete_reverification(str(member.id), str(guild.id))
+        if channel:
+            try:
+                await channel.delete(reason='Re-verification failed or timed out')
+            except discord.Forbidden:
+                pass
+
     async def check_company_verification(self, channel: discord.TextChannel,
                                           member: discord.Member) -> bool:
         """Returns True if verified (and completes the flow), False otherwise."""
@@ -750,6 +866,11 @@ class OnboardingCog(commands.Cog, name='OnboardingCog'):
                 await self.complete_citizen(channel, member)
             elif role == 'embassy':
                 await self.complete_embassy(channel, member)
+            elif role == 'reverify_embassy':
+                await self.complete_embassy(channel, member)
+                await self.bot.db.delete_reverification(str(member.id), str(channel.guild.id))
+            elif role == 'reverify_government':
+                await self.complete_government_reverify(channel, member)
             return True
         return False
 
@@ -782,16 +903,21 @@ class OnboardingCog(commands.Cog, name='OnboardingCog'):
                 to_add.append(discord_role)
             elif not has_role and discord_role in member.roles:
                 to_remove.append(discord_role)
+        add_error = None
+        remove_error = None
         if to_add:
             try:
                 await member.add_roles(*to_add, reason='WarEra: Congo government roles synced')
-            except discord.Forbidden:
-                pass
+            except Exception as e:
+                add_error = str(e)
+                log.warning('sync_congo_local_roles: add_roles failed for %s: %s', member, e)
         if to_remove:
             try:
                 await member.remove_roles(*to_remove, reason='WarEra: Congo government roles synced')
-            except discord.Forbidden:
-                pass
+            except Exception as e:
+                remove_error = str(e)
+                log.warning('sync_congo_local_roles: remove_roles failed for %s: %s', member, e)
+        return to_add, to_remove, add_error, remove_error
 
     async def remove_all_congo_local_roles(
         self, guild: discord.Guild, member: discord.Member, config: dict
@@ -884,8 +1010,8 @@ class OnboardingCog(commands.Cog, name='OnboardingCog'):
                 guild.me: discord.PermissionOverwrite(
                     read_messages=True, send_messages=True, manage_channels=True
                 ),
-                # base_role: read only — no send
-                base_role: discord.PermissionOverwrite(read_messages=True, send_messages=False),
+                # base_role: read only — no send, but can use slash commands
+                base_role: discord.PermissionOverwrite(read_messages=True, send_messages=False, use_application_commands=True),
                 # write_role: read + write + slash commands for /addwrite
                 write_role: discord.PermissionOverwrite(
                     read_messages=True, send_messages=True, use_application_commands=True
@@ -902,7 +1028,7 @@ class OnboardingCog(commands.Cog, name='OnboardingCog'):
         else:
             # Channel already exists — ensure the roles have correct overwrites.
             # This handles cases where roles were recreated after a reset.
-            await channel.set_permissions(base_role, read_messages=True, send_messages=False)
+            await channel.set_permissions(base_role, read_messages=True, send_messages=False, use_application_commands=True)
             await channel.set_permissions(
                 write_role, read_messages=True, send_messages=True, use_application_commands=True
             )
@@ -961,7 +1087,7 @@ class OnboardingCog(commands.Cog, name='OnboardingCog'):
 
             try:
                 if base_role:
-                    await channel.set_permissions(base_role, read_messages=True, send_messages=False)
+                    await channel.set_permissions(base_role, read_messages=True, send_messages=False, use_application_commands=True)
                     if role_color:
                         await base_role.edit(color=role_color, hoist=True)
                 if write_role:

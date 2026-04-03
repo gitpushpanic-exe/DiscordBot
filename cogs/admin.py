@@ -14,8 +14,11 @@ import discord
 from discord import app_commands
 from discord.ext import commands
 
-from country_flags import get_flag
-from warera_api import get_user_lite, get_government_role, get_country_by_id, extract_user_id, CONGO_LOCAL_ROLES, CONGO_COUNTRY_ID
+import json
+import re as _re
+
+from country_flags import get_flag, country_channel_name
+from warera_api import get_user_lite, get_government_role, get_country_by_id, extract_user_id, CONGO_LOCAL_ROLES, CONGO_COUNTRY_ID, set_api_key, batch_get_user_lite
 
 log = logging.getLogger(__name__)
 
@@ -70,7 +73,7 @@ class SetupCategorySelect(discord.ui.View):
 
 class SetupRoleSelect(discord.ui.View):
     def __init__(self, bot, user_id: int, step: str, roles: list,
-                 db_key: str = None, can_create: bool = None):
+                 db_key: str = None, can_create: bool = None, can_skip: bool = False):
         super().__init__(timeout=120)
         self.bot = bot
         self.user_id = user_id
@@ -89,6 +92,8 @@ class SetupRoleSelect(discord.ui.View):
             # capitalize() for lowercase legacy steps ('visitor' → 'Visitor').
             label = step if step[0].isupper() else step.capitalize()
             options.append(discord.SelectOption(label=f'➕ Create "{label}" role', value='__create__'))
+        if can_skip:
+            options.append(discord.SelectOption(label='⏭️ Skip (not applicable)', value='__skip__'))
 
         select = discord.ui.Select(
             placeholder=f'Select {step} role…',
@@ -105,6 +110,13 @@ class SetupRoleSelect(discord.ui.View):
         value = interaction.data['values'][0]
         guild = interaction.guild
 
+        if value == '__skip__':
+            for item in self.children:
+                item.disabled = True
+            label = self.step if self.step[0].isupper() else self.step.capitalize()
+            await interaction.response.edit_message(content=f'⏭️ {label} role skipped.', view=self)
+            return
+
         if value == '__create__':
             role_name = self.step if self.step[0].isupper() else self.step.capitalize()
             role = await guild.create_role(name=role_name, mentionable=True)
@@ -119,6 +131,52 @@ class SetupRoleSelect(discord.ui.View):
             content=f'✅ {label} role set.',
             view=self
         )
+
+
+class SetupApiKeyModal(discord.ui.Modal, title='WarEra API Key'):
+    api_key = discord.ui.TextInput(
+        label='API Key',
+        placeholder='Paste your WarEra API key here (leave blank to clear)',
+        required=False,
+        max_length=200,
+    )
+
+    def __init__(self, bot):
+        super().__init__()
+        self.bot = bot
+
+    async def on_submit(self, interaction: discord.Interaction):
+        key = str(self.api_key.value).strip() or None
+        await self.bot.db.set_guild_config(str(interaction.guild_id), warera_api_key=key)
+        set_api_key(key)
+        status = 'set ✅' if key else 'cleared'
+        await interaction.response.edit_message(
+            content=f'✅ WarEra API key {status}. Rate limit is now **{"200" if key else "100"} req/min**.',
+            view=None
+        )
+
+
+class SetupApiKeyButton(discord.ui.View):
+    def __init__(self, bot, user_id: int):
+        super().__init__(timeout=120)
+        self.bot = bot
+        self.user_id = user_id
+
+    @discord.ui.button(label='Enter API Key', style=discord.ButtonStyle.primary, emoji='🔑')
+    async def enter_key(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if interaction.user.id != self.user_id:
+            await interaction.response.send_message('Not your setup.', ephemeral=True)
+            return
+        await interaction.response.send_modal(SetupApiKeyModal(self.bot))
+
+    @discord.ui.button(label='Skip', style=discord.ButtonStyle.secondary)
+    async def skip(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if interaction.user.id != self.user_id:
+            await interaction.response.send_message('Not your setup.', ephemeral=True)
+            return
+        for item in self.children:
+            item.disabled = True
+        await interaction.response.edit_message(content='⏭️ API key step skipped.', view=self)
 
 
 # ── Admin Cog ─────────────────────────────────────────────────────────────────
@@ -145,7 +203,7 @@ class AdminCog(commands.Cog, name='AdminCog'):
         categories = [c for c in guild.categories]
         roles = [r for r in guild.roles if not r.is_default() and not r.managed]
 
-        total_steps = 5 + len(CONGO_LOCAL_ROLES)
+        total_steps = 7 + len(CONGO_LOCAL_ROLES)
         await interaction.response.send_message(
             f'**Congo Bot Setup — Step 1/{total_steps}**\nSelect the category where **onboarding channels** will be created:',
             view=SetupCategorySelect(self.bot, interaction.user.id, 'onboarding', categories),
@@ -190,7 +248,7 @@ class AdminCog(commands.Cog, name='AdminCog'):
             view=SetupRoleSelect(self.bot, interaction.user.id, 'citizen', roles),
             ephemeral=True
         )
-        # Steps 6–10: Congolese government roles (local Discord roles for citizens)
+        # Steps 6–11: Congolese government roles (local Discord roles for citizens)
         for i, (_, db_key, display_name) in enumerate(CONGO_LOCAL_ROLES, start=6):
             await interaction.followup.send(
                 f'**Step {i}/{total_steps}** — Select or create the **{display_name}** role '
@@ -201,6 +259,25 @@ class AdminCog(commands.Cog, name='AdminCog'):
                 ),
                 ephemeral=True
             )
+        # Elders/Retirement role — optional, exempt from re-verification
+        await interaction.followup.send(
+            f'**Step {total_steps - 1}/{total_steps}** — (Optional) Select the **Elders / Retirement role**.\n'
+            'Members with this role will be exempt from `/admin-reverify-government`.',
+            view=SetupRoleSelect(
+                self.bot, interaction.user.id, 'Elders/Retirement', roles,
+                db_key='elders_role_id', can_create=False, can_skip=True
+            ),
+            ephemeral=True
+        )
+        # Last step: optional WarEra API key (doubles rate limit to 200 req/min)
+        api_key_set = bool((await self.bot.db.get_guild_config(str(guild.id)) or {}).get('warera_api_key'))
+        await interaction.followup.send(
+            f'**Step {total_steps}/{total_steps}** — (Optional) Set your **WarEra API key** '
+            f'to raise the rate limit from 100 to **200 requests/min**.\n'
+            f'Current status: {"✅ API key is set" if api_key_set else "❌ No API key — anonymous limit (100 req/min)"}',
+            view=SetupApiKeyButton(self.bot, interaction.user.id),
+            ephemeral=True
+        )
 
     # ── /config ───────────────────────────────────────────────────────────────
 
@@ -222,12 +299,17 @@ class AdminCog(commands.Cog, name='AdminCog'):
             ('local_role_economy_id',        'SETUP_LOCAL_ROLE_ECONOMY_ID'),
             ('local_role_defense_id',        'SETUP_LOCAL_ROLE_DEFENSE_ID'),
             ('local_role_congress_id',       'SETUP_LOCAL_ROLE_CONGRESS_ID'),
+            ('elders_role_id',               'SETUP_ELDERS_ROLE_ID'),
         ]
 
         lines = ['**Current guild config** (copy IDs into `.env` to survive database resets)\n```']
         for db_key, env_key in fields:
             val = config.get(db_key) or 'not set'
             lines.append(f'{env_key}={val}')
+        # API key — mask all but first 6 chars
+        raw_key = config.get('warera_api_key')
+        masked = (raw_key[:6] + '***') if raw_key else 'not set'
+        lines.append(f'WARERA_API_KEY={masked}')
         lines.append('```')
 
         await interaction.response.send_message('\n'.join(lines), ephemeral=True)
@@ -798,12 +880,18 @@ class AdminCog(commands.Cog, name='AdminCog'):
         # discord_ids where the WarEra API failed — don't touch their roles
         api_failed: set[str] = set()
 
+        # Pre-fetch all WarEra data in batch to minimise HTTP calls
+        eligible_ids = [t['warera_id'] for t in eligible]
+        warera_results = await batch_get_user_lite(eligible_ids)
+        warera_map = {uid: data for uid, data in zip(eligible_ids, warera_results) if data}
+
         updated, errors = 0, 0
+        detail_lines: list[str] = []
         for t in eligible:
             member = guild.get_member(int(t['discord_id']))
             if not member:
                 continue
-            warera_data = await get_user_lite(t['warera_id'])
+            warera_data = warera_map.get(t['warera_id'])
             if not warera_data:
                 errors += 1
                 api_failed.add(str(t['discord_id']))
@@ -820,8 +908,29 @@ class AdminCog(commands.Cog, name='AdminCog'):
                         except discord.Forbidden:
                             pass
 
-            await onboarding.sync_congo_local_roles(guild, member, warera_data, config)
+            added, removed_from_member, add_err, rem_err = await onboarding.sync_congo_local_roles(
+                guild, member, warera_data, config
+            )
             updated += 1
+
+            if add_err:
+                detail_lines.append(
+                    f'⚠️ {member.mention}: failed to **add** '
+                    f'{[r.name for r in added]} — `{add_err}`'
+                )
+            elif added:
+                detail_lines.append(
+                    f'➕ {member.mention}: added {[r.name for r in added]}'
+                )
+            if rem_err:
+                detail_lines.append(
+                    f'⚠️ {member.mention}: failed to **remove** '
+                    f'{[r.name for r in removed_from_member]} — `{rem_err}`'
+                )
+            elif removed_from_member:
+                detail_lines.append(
+                    f'➖ {member.mention}: removed {[r.name for r in removed_from_member]}'
+                )
 
             # Record which roles this member legitimately holds
             infos = warera_data.get('infos', {})
@@ -842,23 +951,24 @@ class AdminCog(commands.Cog, name='AdminCog'):
             for m in list(discord_role.members):
                 mid = str(m.id)
                 if mid in api_failed:
-                    continue  # Couldn't verify — leave role alone
+                    continue
                 if db_key in qualified.get(mid, set()):
-                    continue  # Verified they qualify — keep role
-                # Not a tracked citizen, or citizen without this WarEra role
+                    continue
                 try:
                     await m.remove_roles(
                         discord_role, reason=f'Local role audit: does not qualify for Congo {display_name}'
                     )
                     removed += 1
-                except discord.Forbidden:
-                    pass
+                except Exception as e:
+                    detail_lines.append(f'⚠️ {m.mention}: failed to remove `{discord_role.name}` — `{e}`')
 
-        parts = [f'✅ Synced Congolese government roles for **{updated}** citizen(s).']
+        parts = [f'✅ Synced Congolese government roles for **{updated}** member(s).']
         if removed:
-            parts.append(f'🗑️ Removed unqualified role assignments from **{removed}** member(s).')
+            parts.append(f'🗑️ Removed unqualified assignments from **{removed}** member(s).')
         if errors:
-            parts.append(f'⚠️ Could not fetch WarEra data for **{errors}** member(s) (roles left unchanged).')
+            parts.append(f'⚠️ WarEra API failed for **{errors}** member(s) (roles left unchanged).')
+        if detail_lines:
+            parts.append('\n' + '\n'.join(detail_lines))
         await interaction.followup.send('\n'.join(parts), ephemeral=True)
 
     # ── /admin-diagnose-member ────────────────────────────────────────────────
@@ -939,6 +1049,470 @@ class AdminCog(commands.Cog, name='AdminCog'):
             await interaction.followup.send('✅ Database backed up successfully.', ephemeral=True)
         except Exception as e:
             await interaction.followup.send(f'❌ Backup failed: {e}', ephemeral=True)
+
+    # ── /senate-addwrite ──────────────────────────────────────────────────────
+
+    @app_commands.command(
+        name='senate-addwrite',
+        description='[Senate] Grant write access in a member\'s embassy as a Senate guarantor.'
+    )
+    @app_commands.describe(user='The embassy member to grant write access to.')
+    async def senate_addwrite(self, interaction: discord.Interaction, user: discord.Member):
+        if not await self._is_senate(interaction):
+            await interaction.response.send_message('Senate role required.', ephemeral=True)
+            return
+
+        await interaction.response.defer(ephemeral=True)
+        guild = interaction.guild
+
+        if user.id == interaction.user.id:
+            await interaction.followup.send('You cannot grant write access to yourself.', ephemeral=True)
+            return
+
+        # Target must be a tracked embassy member
+        target_tracked = await self.bot.db.get_tracked_user(str(user.id), str(guild.id))
+        if not target_tracked or target_tracked.get('assigned_role') != 'embassy':
+            await interaction.followup.send(
+                f'{user.mention} is not registered as an embassy member.', ephemeral=True
+            )
+            return
+
+        embassy_req = await self.bot.db.get_embassy_request(str(user.id), str(guild.id))
+        if not embassy_req or not embassy_req.get('embassy_write_role_id'):
+            await interaction.followup.send(
+                f'Could not find the embassy write role for {user.mention}\'s country. '
+                'Make sure their embassy is set up.', ephemeral=True
+            )
+            return
+
+        write_role = guild.get_role(int(embassy_req['embassy_write_role_id']))
+        if not write_role:
+            await interaction.followup.send(
+                'The embassy write role no longer exists. Please contact an admin.', ephemeral=True
+            )
+            return
+
+        if write_role in user.roles:
+            await interaction.followup.send(
+                f'{user.mention} already has write access.', ephemeral=True
+            )
+            return
+
+        try:
+            await user.add_roles(write_role, reason=f'Senate write grant by {interaction.user}')
+        except discord.Forbidden:
+            await interaction.followup.send(
+                'I do not have permission to assign that role.', ephemeral=True
+            )
+            return
+
+        # Record grant with grant_type='senate'; grantor_warera_id is empty (no WarEra ID needed)
+        await self.bot.db.add_write_grant(
+            grantor_discord_id=str(interaction.user.id),
+            grantor_warera_id='',
+            grantee_discord_id=str(user.id),
+            guild_id=str(guild.id),
+            country_id=embassy_req['country_id'],
+            write_role_id=str(write_role.id),
+            grant_type='senate'
+        )
+
+        # Notify in the embassy channel
+        if embassy_req.get('embassy_channel_id'):
+            emb_channel = guild.get_channel(int(embassy_req['embassy_channel_id']))
+            if emb_channel:
+                await emb_channel.send(
+                    f'✅ Senator {interaction.user.mention} has granted **write access** to {user.mention}.'
+                )
+
+        await interaction.followup.send(
+            f'✅ Write access granted to {user.mention}.\n'
+            '⚠️ This access will be automatically revoked if you lose your Senate role.',
+            ephemeral=True
+        )
+
+    # ── /admin-restore-senate-write ───────────────────────────────────────────
+
+    @app_commands.command(
+        name='admin-restore-senate-write',
+        description='[Admin] Restore a Senate write grant after a database reset.'
+    )
+    @app_commands.default_permissions(administrator=True)
+    @app_commands.describe(
+        senator='The Senate member who is the guarantor',
+        grantee='The embassy member who receives write access'
+    )
+    async def admin_restore_senate_write(
+        self, interaction: discord.Interaction,
+        senator: discord.Member,
+        grantee: discord.Member
+    ):
+        await interaction.response.defer(ephemeral=True)
+        guild = interaction.guild
+        config = await self.bot.db.get_guild_config(str(guild.id))
+
+        # Verify senator still holds the Senate role
+        senate_role = None
+        if config and config.get('senate_role_id'):
+            senate_role = guild.get_role(int(config['senate_role_id']))
+        if not senate_role or senate_role not in senator.roles:
+            await interaction.followup.send(
+                f'{senator.mention} does not currently hold the Senate role.', ephemeral=True
+            )
+            return
+
+        # Grantee must be a tracked embassy member
+        grantee_tracked = await self.bot.db.get_tracked_user(str(grantee.id), str(guild.id))
+        if not grantee_tracked or grantee_tracked.get('assigned_role') != 'embassy':
+            await interaction.followup.send(
+                f'{grantee.mention} is not registered as an embassy member. '
+                'Run `/admin-restore` for them first.', ephemeral=True
+            )
+            return
+
+        embassy_req = await self.bot.db.get_embassy_request(str(grantee.id), str(guild.id))
+        if not embassy_req or not embassy_req.get('embassy_write_role_id'):
+            await interaction.followup.send(
+                f'Could not find the embassy write role for {grantee.mention}\'s country.',
+                ephemeral=True
+            )
+            return
+
+        write_role = guild.get_role(int(embassy_req['embassy_write_role_id']))
+        if not write_role:
+            await interaction.followup.send(
+                'The embassy write role no longer exists in Discord.', ephemeral=True
+            )
+            return
+
+        if write_role not in grantee.roles:
+            try:
+                await grantee.add_roles(write_role, reason=f'Senate write grant restored by {interaction.user}')
+            except discord.Forbidden:
+                await interaction.followup.send(
+                    'I do not have permission to assign that role.', ephemeral=True
+                )
+                return
+
+        await self.bot.db.add_write_grant(
+            grantor_discord_id=str(senator.id),
+            grantor_warera_id='',
+            grantee_discord_id=str(grantee.id),
+            guild_id=str(guild.id),
+            country_id=embassy_req['country_id'],
+            write_role_id=str(write_role.id),
+            grant_type='senate'
+        )
+
+        await interaction.followup.send(
+            f'✅ Senate write grant restored: {senator.mention} → {grantee.mention} '
+            f'({embassy_req.get("country_name", "unknown country")}).',
+            ephemeral=True
+        )
+
+    # ── /admin-run-audit ──────────────────────────────────────────────────────
+
+    @app_commands.command(
+        name='admin-run-audit',
+        description='Manually trigger the daily role audit (embassy sync, write grant validation).'
+    )
+    @app_commands.default_permissions(administrator=True)
+    async def admin_run_audit(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True)
+        from cogs.scheduler import SchedulerCog
+        scheduler: SchedulerCog = self.bot.get_cog('SchedulerCog')
+        if not scheduler:
+            await interaction.followup.send('Scheduler cog not loaded.', ephemeral=True)
+            return
+        guild = interaction.guild
+        tracked = await self.bot.db.get_all_tracked_users(str(guild.id))
+        await interaction.followup.send(
+            f'Running audit on **{len(tracked)}** tracked users… this may take a moment.',
+            ephemeral=True
+        )
+        await scheduler._run_audit(guild)
+        await interaction.followup.send('✅ Audit complete.', ephemeral=True)
+
+    # ── /admin-reverify-embassies ─────────────────────────────────────────────
+
+    @app_commands.command(
+        name='admin-reverify-embassies',
+        description='Rename embassy channels to current schema and start re-verification for all non-senate members.'
+    )
+    @app_commands.default_permissions(administrator=True)
+    @app_commands.describe(category='The category containing embassy channels (defaults to configured embassy category).')
+    async def admin_reverify_embassies(
+        self, interaction: discord.Interaction,
+        category: discord.CategoryChannel = None
+    ):
+        await interaction.response.defer(ephemeral=True)
+        guild = interaction.guild
+        config = await self.bot.db.get_guild_config(str(guild.id))
+        if not config:
+            await interaction.followup.send('Bot not configured — run `/setup` first.', ephemeral=True)
+            return
+
+        if category is None:
+            cat_id = config.get('embassy_category_id')
+            if not cat_id:
+                await interaction.followup.send('No embassy category configured and none provided.', ephemeral=True)
+                return
+            category = guild.get_channel(int(cat_id))
+            if not category:
+                await interaction.followup.send('Configured embassy category not found in this server.', ephemeral=True)
+                return
+
+        senate_role_id = config.get('senate_role_id')
+        senate_role = guild.get_role(int(senate_role_id)) if senate_role_id else None
+        onboarding_cat_id = config.get('onboarding_category_id')
+        onboarding_cat = guild.get_channel(int(onboarding_cat_id)) if onboarding_cat_id else None
+        visitor_role_id = config.get('visitor_role_id')
+
+        renamed = 0
+        started = 0
+        skipped = 0
+
+        for channel in category.text_channels:
+            # 1. Determine country info from DB or channel name
+            embassy_req_by_channel = None
+            async with __import__('aiosqlite').connect(self.bot.db.db_path) as db:
+                db.row_factory = __import__('aiosqlite').Row
+                async with db.execute(
+                    'SELECT * FROM embassy_requests WHERE embassy_channel_id = ? LIMIT 1',
+                    (str(channel.id),)
+                ) as cur:
+                    row = await cur.fetchone()
+                    if row:
+                        embassy_req_by_channel = dict(row)
+
+            if embassy_req_by_channel:
+                country_name = embassy_req_by_channel['country_name'] or ''
+                country_flag = embassy_req_by_channel['country_flag'] or ''
+                country_id = embassy_req_by_channel['country_id']
+                base_role_id = embassy_req_by_channel.get('embassy_role_id')
+                write_role_id = embassy_req_by_channel.get('embassy_write_role_id')
+            else:
+                # Parse country name from channel name (e.g. "france-embassy" or "embassy-france")
+                raw = channel.name.lower()
+                raw = _re.sub(r'^embassy[-_]?', '', raw)
+                raw = _re.sub(r'[-_]?embassy$', '', raw)
+                country_name = raw.replace('-', ' ').replace('_', ' ').strip().title()
+                country_flag = get_flag(country_name)
+                country_id = None
+                base_role_id = None
+                write_role_id = None
+                # Try to find matching role by name pattern
+                base_role = discord.utils.find(
+                    lambda r: r.name.lower().startswith(f'embassy {country_name.lower()}')
+                              and 'official' not in r.name.lower(),
+                    guild.roles
+                )
+                write_role = discord.utils.find(
+                    lambda r: r.name.lower().startswith(f'embassy {country_name.lower()}')
+                              and 'official' in r.name.lower(),
+                    guild.roles
+                )
+                if base_role:
+                    base_role_id = str(base_role.id)
+                if write_role:
+                    write_role_id = str(write_role.id)
+
+            if not country_name:
+                skipped += 1
+                continue
+
+            # 2. Rename channel to current schema
+            new_name = f'embassy-{country_channel_name(country_name)}'
+            if channel.name != new_name:
+                try:
+                    await channel.edit(name=new_name)
+                    renamed += 1
+                except discord.Forbidden:
+                    pass
+
+            if not base_role_id:
+                skipped += 1
+                continue
+
+            base_role = guild.get_role(int(base_role_id))
+            if not base_role:
+                skipped += 1
+                continue
+
+            roles_to_remove = [base_role_id]
+            if write_role_id:
+                roles_to_remove.append(write_role_id)
+
+            # 3. Start re-verification for each holder of the base role
+            for member in guild.members:
+                if base_role not in member.roles:
+                    continue
+                if senate_role and senate_role in member.roles:
+                    continue  # senators are exempt
+                if member.bot:
+                    continue
+
+                existing = await self.bot.db.get_user_request(str(member.id), str(guild.id))
+                if existing and existing.get('status') not in ('completed', 'rejected'):
+                    continue  # already in a flow
+
+                # Pre-populate embassy_requests so complete_embassy can find it
+                if country_name and country_id:
+                    await self.bot.db.upsert_embassy_request_for_reverify(
+                        str(member.id), str(guild.id),
+                        country_id, country_name, country_flag
+                    )
+
+                # Create private reverification channel
+                safe_name = _re.sub(r'[^a-z0-9\-]', '', member.name.lower().replace(' ', '-'))[:20]
+                rev_channel = await guild.create_text_channel(
+                    f'reverify-{safe_name}',
+                    category=onboarding_cat,
+                    overwrites={
+                        guild.default_role: discord.PermissionOverwrite(read_messages=False),
+                        member: discord.PermissionOverwrite(read_messages=True, send_messages=True),
+                        guild.me: discord.PermissionOverwrite(
+                            read_messages=True, send_messages=True,
+                            manage_channels=True, manage_messages=True
+                        ),
+                    },
+                    topic=f'Embassy re-verification for {member.name}'
+                )
+
+                await self.bot.db.create_user_request(
+                    str(member.id), str(guild.id), str(rev_channel.id),
+                    requested_role='reverify_embassy'
+                )
+                await self.bot.db.create_reverification(
+                    str(member.id), str(guild.id), roles_to_remove, 'embassy'
+                )
+
+                embed = discord.Embed(
+                    title='🏛️ Embassy Re-Verification Required',
+                    description=(
+                        f'Hello {member.mention}!\n\n'
+                        f'As part of a server migration, all embassy members must re-verify '
+                        f'their government role in WarEra.\n\n'
+                        f'**You have 21 days** to complete this.\n\n'
+                        'Please provide your **WarEra.io user ID or profile link** to begin:'
+                    ),
+                    color=discord.Color.orange()
+                )
+                await rev_channel.send(embed=embed)
+                started += 1
+
+        await interaction.followup.send(
+            f'✅ Done.\n'
+            f'• Channels renamed: **{renamed}**\n'
+            f'• Re-verifications started: **{started}**\n'
+            f'• Channels skipped (no role info): **{skipped}**',
+            ephemeral=True
+        )
+
+    # ── /admin-reverify-government ────────────────────────────────────────────
+
+    @app_commands.command(
+        name='admin-reverify-government',
+        description='Require all members with access to a channel to re-verify a government/congress role.'
+    )
+    @app_commands.default_permissions(administrator=True)
+    @app_commands.describe(channel='The government channel whose members must re-verify.')
+    async def admin_reverify_government(
+        self, interaction: discord.Interaction,
+        channel: discord.TextChannel
+    ):
+        await interaction.response.defer(ephemeral=True)
+        guild = interaction.guild
+        config = await self.bot.db.get_guild_config(str(guild.id))
+        if not config:
+            await interaction.followup.send('Bot not configured — run `/setup` first.', ephemeral=True)
+            return
+
+        senate_role_id = config.get('senate_role_id')
+        senate_role = guild.get_role(int(senate_role_id)) if senate_role_id else None
+        elders_role_id = config.get('elders_role_id')
+        elders_role = guild.get_role(int(elders_role_id)) if elders_role_id else None
+        onboarding_cat_id = config.get('onboarding_category_id')
+        onboarding_cat = guild.get_channel(int(onboarding_cat_id)) if onboarding_cat_id else None
+
+        # Collect Congo local role IDs for roles_to_remove on failure
+        local_role_ids = []
+        for _, db_key, _ in CONGO_LOCAL_ROLES:
+            rid = config.get(db_key)
+            if rid:
+                local_role_ids.append(rid)
+
+        started = 0
+        skipped = 0
+
+        for member in guild.members:
+            if member.bot:
+                continue
+            if member.guild_permissions.administrator:
+                continue
+            if senate_role and senate_role in member.roles:
+                continue  # senators exempt
+            if elders_role and elders_role in member.roles:
+                continue  # elders exempt
+
+            perms = channel.permissions_for(member)
+            if not perms.read_messages:
+                continue
+
+            existing = await self.bot.db.get_user_request(str(member.id), str(guild.id))
+            if existing and existing.get('status') not in ('completed', 'rejected'):
+                skipped += 1
+                continue
+
+            # Collect which local Congo roles this member currently holds
+            roles_to_remove = [
+                rid for rid in local_role_ids
+                if guild.get_role(int(rid)) in member.roles
+            ]
+
+            safe_name = _re.sub(r'[^a-z0-9\-]', '', member.name.lower().replace(' ', '-'))[:20]
+            rev_channel = await guild.create_text_channel(
+                f'reverify-{safe_name}',
+                category=onboarding_cat,
+                overwrites={
+                    guild.default_role: discord.PermissionOverwrite(read_messages=False),
+                    member: discord.PermissionOverwrite(read_messages=True, send_messages=True),
+                    guild.me: discord.PermissionOverwrite(
+                        read_messages=True, send_messages=True,
+                        manage_channels=True, manage_messages=True
+                    ),
+                },
+                topic=f'Government re-verification for {member.name}'
+            )
+
+            await self.bot.db.create_user_request(
+                str(member.id), str(guild.id), str(rev_channel.id),
+                requested_role='reverify_government'
+            )
+            await self.bot.db.create_reverification(
+                str(member.id), str(guild.id), roles_to_remove, 'government'
+            )
+
+            embed = discord.Embed(
+                title='🏛️ Government Access Re-Verification',
+                description=(
+                    f'Hello {member.mention}!\n\n'
+                    f'To keep your access to {channel.mention}, you must re-verify that '
+                    f'you hold a **congress or government position** in WarEra.\n\n'
+                    f'**You have 21 days** to complete this.\n\n'
+                    'Please provide your **WarEra.io user ID or profile link** to begin:'
+                ),
+                color=discord.Color.orange()
+            )
+            await rev_channel.send(embed=embed)
+            started += 1
+
+        await interaction.followup.send(
+            f'✅ Done.\n'
+            f'• Re-verifications started: **{started}**\n'
+            f'• Already in a flow (skipped): **{skipped}**',
+            ephemeral=True
+        )
 
 
 async def setup(bot):

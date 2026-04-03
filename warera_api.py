@@ -1,9 +1,18 @@
+import asyncio
+import os
 import re
 import aiohttp
 from typing import Optional, Dict, List
 
 BASE = 'https://api2.warera.io/trpc'
 HEADERS = {'accept': '*/*', 'Content-Type': 'application/json'}
+
+_API_KEY: Optional[str] = os.getenv('WARERA_API_KEY') or None
+
+
+def set_api_key(key: Optional[str]):
+    global _API_KEY
+    _API_KEY = key.strip() if key and key.strip() else None
 
 
 def extract_user_id(text: str) -> Optional[str]:
@@ -13,14 +22,55 @@ def extract_user_id(text: str) -> Optional[str]:
 
 
 async def _post(endpoint: str, payload: dict) -> Optional[dict]:
+    headers = dict(HEADERS)
+    if _API_KEY:
+        headers['x-api-key'] = _API_KEY
     async with aiohttp.ClientSession() as session:
         async with session.post(
-            f'{BASE}/{endpoint}', json=payload, headers=HEADERS
+            f'{BASE}/{endpoint}', json=payload, headers=headers
         ) as resp:
             if resp.status == 200:
                 data = await resp.json()
                 return data.get('result', {}).get('data')
     return None
+
+
+async def _batch_post(calls: list) -> list:
+    """Send multiple tRPC calls in a single HTTP request (?batch=1)."""
+    if not calls:
+        return []
+    if len(calls) == 1:
+        return [await _post(calls[0][0], calls[0][1])]
+    headers = dict(HEADERS)
+    if _API_KEY:
+        headers['x-api-key'] = _API_KEY
+    path = ','.join(ep for ep, _ in calls)
+    body = {str(i): payload for i, (_, payload) in enumerate(calls)}
+    async with aiohttp.ClientSession() as session:
+        async with session.post(
+            f'{BASE}/{path}?batch=1', json=body, headers=headers
+        ) as resp:
+            if resp.status != 200:
+                return [None] * len(calls)
+            data = await resp.json()
+            if not isinstance(data, list):
+                return [None] * len(calls)
+            return [
+                item.get('result', {}).get('data') if isinstance(item, dict) else None
+                for item in data
+            ]
+
+
+async def batch_get_user_lite(user_ids: list, chunk_size: int = 50) -> list:
+    """Fetch multiple users via tRPC batch, in chunks of chunk_size."""
+    results: list = []
+    for i in range(0, len(user_ids), chunk_size):
+        chunk = user_ids[i:i + chunk_size]
+        calls = [('user.getUserLite', {'userId': uid}) for uid in chunk]
+        results.extend(await _batch_post(calls))
+        if i + chunk_size < len(user_ids):
+            await asyncio.sleep(0.3)
+    return results
 
 
 async def get_user_lite(user_id: str) -> Optional[Dict]:
@@ -40,6 +90,14 @@ async def get_user_company_ids(user_id: str) -> List[str]:
 
 async def get_company(company_id: str) -> Optional[Dict]:
     return await _post('company.getById', {'companyId': company_id})
+
+
+async def get_users_by_country(country_id: str, cursor: str = None) -> Optional[Dict]:
+    """Returns {'items': [...], 'nextCursor': str|None}"""
+    payload: dict = {'countryId': country_id, 'limit': 100}
+    if cursor:
+        payload['cursor'] = cursor
+    return await _post('user.getUsersByCountry', payload)
 
 
 async def get_company_names(user_id: str) -> List[str]:
