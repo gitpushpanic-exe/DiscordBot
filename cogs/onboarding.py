@@ -23,8 +23,9 @@ from discord.ext import commands
 from country_flags import country_channel_name, get_flag, get_flag_color
 from warera_api import (
     extract_user_id, get_user_lite, get_country_by_id,
-    get_company_names, get_government_role, role_display_name, get_all_roles_display,
-    CONGO_LOCAL_ROLES
+    get_company_names, get_government_role, get_government_role_from_govt_data,
+    role_display_name, get_all_roles_display,
+    get_government_by_country_id, CONGO_LOCAL_ROLES
 )
 
 log = logging.getLogger(__name__)
@@ -526,8 +527,12 @@ class OnboardingCog(commands.Cog, name='OnboardingCog'):
     async def start_embassy(self, channel: discord.TextChannel,
                              member: discord.Member, warera_data: dict):
         guild = channel.guild
-        infos = warera_data.get('infos', {})
-        role_field, access_level, country_id = get_government_role(infos)
+        user_country_id = warera_data.get('country')
+        user_warera_id = warera_data.get('_id', '')
+        govt_data = await get_government_by_country_id(user_country_id) if user_country_id else None
+        role_field, access_level, country_id = get_government_role_from_govt_data(
+            user_warera_id, user_country_id or '', govt_data or {}
+        )
 
         if not role_field:
             await self._handle_embassy_no_role(channel, member, warera_data)
@@ -751,8 +756,11 @@ class OnboardingCog(commands.Cog, name='OnboardingCog'):
                                          member: discord.Member, warera_data: dict):
         """Start the company-rename step for a government re-verification."""
         guild = channel.guild
-        infos = warera_data.get('infos', {})
-        role_field, _, _ = get_government_role(infos)
+        user_warera_id = warera_data.get('_id', '')
+        govt_data = await get_government_by_country_id(CONGO_COUNTRY_ID)
+        role_field, _, _ = get_government_role_from_govt_data(
+            user_warera_id, CONGO_COUNTRY_ID, govt_data or {}
+        )
         if not role_field:
             await channel.send(
                 f'{member.mention} ❌ No congress or government role detected in WarEra. '
@@ -878,27 +886,33 @@ class OnboardingCog(commands.Cog, name='OnboardingCog'):
 
     async def sync_congo_local_roles(
         self, guild: discord.Guild, member: discord.Member,
-        warera_data: dict, config: dict
+        warera_data: dict, config: dict, govt_data: dict = None
     ):
         """
-        Assign or remove the configured Congolese government Discord roles for a
-        citizen based on their current WarEra infos.  Only roles that are
-        configured in guild_config are touched; unconfigured roles are skipped.
-        All additions and removals are batched into single API calls so that
-        members with multiple concurrent roles (e.g. President + Congress Member)
-        are handled correctly without hitting per-call failures.
+        Assign or remove the configured Congolese government Discord roles for a citizen
+        based on the live government.getByCountryId response.  Pass a pre-fetched govt_data
+        dict to avoid a redundant API call when syncing many members at once.
+        If the government endpoint is unavailable (returns None), the sync is skipped
+        entirely so that existing roles are never stripped due to an API failure.
         """
-        infos = warera_data.get('infos', {})
+        if govt_data is None:
+            govt_data = await get_government_by_country_id(CONGO_COUNTRY_ID)
+        if govt_data is None:
+            log.warning('sync_congo_local_roles: government API unavailable, skipping sync for %s', member)
+            return [], [], None, None
+
+        user_id = warera_data.get('_id', '')
         to_add = []
         to_remove = []
-        for warera_field, db_key, _ in CONGO_LOCAL_ROLES:
+        for govt_field, db_key, _ in CONGO_LOCAL_ROLES:
             role_id = config.get(db_key) if config else None
             if not role_id:
                 continue
             discord_role = guild.get_role(int(role_id))
             if not discord_role:
                 continue
-            has_role = (infos.get(warera_field) == CONGO_COUNTRY_ID)
+            val = govt_data.get(govt_field)
+            has_role = (user_id in val) if isinstance(val, list) else (val == user_id and bool(user_id))
             if has_role and discord_role not in member.roles:
                 to_add.append(discord_role)
             elif not has_role and discord_role in member.roles:

@@ -100,6 +100,42 @@ async def get_users_by_country(country_id: str, cursor: str = None) -> Optional[
     return await _post('user.getUsersByCountry', payload)
 
 
+async def get_government_by_country_id(country_id: str) -> Optional[Dict]:
+    """Returns {president, vicePresident, minOfForeignAffairs, minOfEconomy,
+    minOfDefense, congressMembers (list)} as WarEra user IDs."""
+    return await _post('government.getByCountryId', {'countryId': country_id})
+
+
+async def batch_get_government_by_country_ids(country_ids: list) -> dict:
+    """Fetch government data for multiple countries in one batch request.
+    Returns {country_id: govt_data} for countries where the API succeeded."""
+    if not country_ids:
+        return {}
+    calls = [('government.getByCountryId', {'countryId': cid}) for cid in country_ids]
+    results = await _batch_post(calls)
+    return {cid: data for cid, data in zip(country_ids, results) if data}
+
+
+def get_government_role_from_govt_data(user_warera_id: str, country_id: str, govt_data: dict) -> tuple:
+    """Returns (role_field, access_level, country_id) — same shape as get_government_role —
+    but using government.getByCountryId data instead of getUserLite.infos.
+    role_field uses the …Of naming convention for compatibility with role_display_name etc.
+    Returns (None, None, None) if the user holds no role or govt_data is unavailable."""
+    if not user_warera_id or not govt_data:
+        return None, None, None
+    for gf, rf in [('president', 'presidentOf'), ('vicePresident', 'vicePresidentOf'),
+                   ('minOfForeignAffairs', 'minOfForeignAffairsOf')]:
+        if govt_data.get(gf) == user_warera_id:
+            return rf, 'write', country_id
+    for gf, rf in [('minOfEconomy', 'minOfEconomyOf'), ('minOfDefense', 'minOfDefenseOf')]:
+        if govt_data.get(gf) == user_warera_id:
+            return rf, 'read', country_id
+    congress = govt_data.get('congressMembers', [])
+    if isinstance(congress, list) and user_warera_id in congress:
+        return 'congressMemberOf', 'read', country_id
+    return None, None, None
+
+
 async def get_company_names(user_id: str) -> List[str]:
     company_ids = await get_user_company_ids(user_id)
     names = []
@@ -112,15 +148,49 @@ async def get_company_names(user_id: str) -> List[str]:
 
 CONGO_COUNTRY_ID = '6873d0ea1758b40e712b5f4c'
 
-# Mapping of (warera_field, db_config_key, display_name) for Congolese government roles.
-# These are local Discord roles granted to citizens who hold these positions in Congo.
+# Skill keys from getUserLite that are considered economic (eco) builds.
+# All other skills (attack, armor, criticalChance, etc.) are war skills.
+ECO_SKILLS = frozenset({'entrepreneurship', 'energy', 'production', 'companies', 'management'})
+
+
+def classify_player_build(skills: dict) -> str:
+    """Classify a player's build as 'eco', 'war', 'hybrid', or 'uncategorized'.
+
+    Uses the ``skills`` dict from getUserLite where each value has a ``level`` int.
+    Eco skills: entrepreneurship, energy, production, companies, management.
+    Everything else counts as a war skill.
+    """
+    if not skills or not isinstance(skills, dict):
+        return 'uncategorized'
+    eco = sum(
+        v.get('level', 0) for k, v in skills.items()
+        if k in ECO_SKILLS and isinstance(v, dict)
+    )
+    war = sum(
+        v.get('level', 0) for k, v in skills.items()
+        if k not in ECO_SKILLS and isinstance(v, dict)
+    )
+    total = eco + war
+    if total == 0:
+        return 'uncategorized'
+    ratio = eco / total
+    if ratio >= 0.7:
+        return 'eco'
+    if ratio <= 0.3:
+        return 'war'
+    return 'hybrid'
+
+# Mapping of (govt_field, db_config_key, display_name) for Congolese government roles.
+# govt_field matches the keys from government.getByCountryId:
+#   president/vicePresident/minOf* → single user-ID string
+#   congressMembers                → list of user-ID strings
 CONGO_LOCAL_ROLES = [
-    ('presidentOf',           'local_role_president_id',       'President'),
-    ('vicePresidentOf',       'local_role_vice_president_id',  'Vice President'),
-    ('minOfForeignAffairsOf', 'local_role_mfa_id',             'Minister of Foreign Affairs'),
-    ('minOfEconomyOf',        'local_role_economy_id',         'Minister of Economy'),
-    ('minOfDefenseOf',        'local_role_defense_id',         'Minister of Defense'),
-    ('congressMemberOf',      'local_role_congress_id',        'Congress Member'),
+    ('president',          'local_role_president_id',       'President'),
+    ('vicePresident',      'local_role_vice_president_id',  'Vice President'),
+    ('minOfForeignAffairs','local_role_mfa_id',             'Minister of Foreign Affairs'),
+    ('minOfEconomy',       'local_role_economy_id',         'Minister of Economy'),
+    ('minOfDefense',       'local_role_defense_id',         'Minister of Defense'),
+    ('congressMembers',    'local_role_congress_id',        'Congress Member'),
 ]
 
 

@@ -13,7 +13,7 @@ import discord
 from discord.ext import commands, tasks
 
 from country_flags import get_flag
-from warera_api import get_user_lite, get_government_role, role_display_name, get_country_by_id, CONGO_LOCAL_ROLES, batch_get_user_lite
+from warera_api import get_user_lite, get_government_role, get_government_role_from_govt_data, role_display_name, get_country_by_id, CONGO_LOCAL_ROLES, batch_get_user_lite, get_government_by_country_id, batch_get_government_by_country_ids
 
 log = logging.getLogger(__name__)
 
@@ -405,6 +405,19 @@ class SchedulerCog(commands.Cog, name='SchedulerCog'):
         warera_results = await batch_get_user_lite(all_warera_ids)
         warera_map = {uid: data for uid, data in zip(all_warera_ids, warera_results) if data}
 
+        # Pre-fetch Congo government data once for the entire audit run
+        congo_govt = await get_government_by_country_id(CONGO_COUNTRY_ID)
+
+        # Pre-fetch government data for all foreign countries with embassy members
+        embassy_country_ids = list({
+            t.get('country_id') for t in tracked
+            if t.get('assigned_role') == 'embassy' and t.get('country_id')
+        } - {CONGO_COUNTRY_ID})
+        extra_govts = await batch_get_government_by_country_ids(embassy_country_ids)
+        govt_by_country = {**extra_govts}
+        if congo_govt:
+            govt_by_country[CONGO_COUNTRY_ID] = congo_govt
+
         for t in tracked:
             member = guild.get_member(int(t['discord_id']))
             if not member:
@@ -423,18 +436,55 @@ class SchedulerCog(commands.Cog, name='SchedulerCog'):
                 else:
                     onboarding = self._get_onboarding()
                     if onboarding:
-                        await onboarding.sync_congo_local_roles(guild, member, warera_data, config)
+                        await onboarding.sync_congo_local_roles(guild, member, warera_data, config, govt_data=congo_govt)
 
             elif assigned == 'visitor':
-                infos = warera_data.get('infos', {})
-                role_field, access_level, _ = get_government_role(infos)
+                current_country = warera_data.get('country')
+                visitor_govt = govt_by_country.get(current_country) if current_country else None
+                if visitor_govt is None and current_country:
+                    visitor_govt = await get_government_by_country_id(current_country)
+                    if visitor_govt:
+                        govt_by_country[current_country] = visitor_govt
+                user_warera_id = warera_data.get('_id', '')
+                if visitor_govt:
+                    role_field, access_level, _ = get_government_role_from_govt_data(
+                        user_warera_id, current_country, visitor_govt
+                    )
+                else:
+                    infos = warera_data.get('infos', {})
+                    role_field, access_level, _ = get_government_role(infos)
+
+                # Sync Congo local government roles for visitors who are Congo citizens
+                if current_country == CONGO_COUNTRY_ID:
+                    onboarding = self._get_onboarding()
+                    if onboarding:
+                        await onboarding.sync_congo_local_roles(
+                            guild, member, warera_data, config, govt_data=congo_govt
+                        )
+
                 if role_field and access_level:
-                    await self._notify_upgrade_available(member, role_field)
+                    if (current_country and current_country != CONGO_COUNTRY_ID
+                            and t.get('country_id') == current_country):
+                        # Was previously an embassy member for this country — re-promote
+                        log.info('Re-promoting %s from visitor to embassy (role detected)', member)
+                        await self._switch_embassy(
+                            guild, member, t, config, warera_data,
+                            current_country, access_level, role_field
+                        )
+                    elif current_country != CONGO_COUNTRY_ID:
+                        await self._notify_upgrade_available(member, role_field)
 
             elif assigned == 'embassy':
-                infos = warera_data.get('infos', {})
-                role_field, access_level, warera_role = get_government_role(infos)
                 current_country = warera_data.get('country')
+                member_govt = govt_by_country.get(current_country) if current_country else None
+                if member_govt is None:
+                    # Government API unavailable for this country — skip to avoid false downgrade
+                    log.warning('_run_audit: no govt data for country %s, skipping %s', current_country, member)
+                    continue
+                user_warera_id = warera_data.get('_id', '')
+                role_field, access_level, warera_role = get_government_role_from_govt_data(
+                    user_warera_id, current_country, member_govt
+                )
                 country_changed = bool(current_country and current_country != t.get('country_id'))
                 if current_country == CONGO_COUNTRY_ID:
                     citizen_role_id = config.get('citizen_role_id') if config else None
@@ -447,7 +497,7 @@ class SchedulerCog(commands.Cog, name='SchedulerCog'):
                                 pass
                     onboarding = self._get_onboarding()
                     if onboarding:
-                        await onboarding.sync_congo_local_roles(guild, member, warera_data, config)
+                        await onboarding.sync_congo_local_roles(guild, member, warera_data, config, govt_data=congo_govt)
                 if not role_field:
                     log.info(f'Downgrading {member} from embassy (lost government role)')
                     await self._downgrade_to_visitor(guild, member, t, config, warera_data)
@@ -465,7 +515,8 @@ class SchedulerCog(commands.Cog, name='SchedulerCog'):
         await self._audit_write_grants(guild)
 
     async def _audit_write_grants(self, guild: discord.Guild):
-        """Check all write grants and revoke any where the grantor lost their qualifying role."""
+        """Check all write grants: revoke grants whose grantor lost their qualifying role,
+        and re-apply any missing Discord write roles for grants that are still valid."""
         grants = await self.bot.db.get_all_write_grants(str(guild.id))
 
         # Pre-load the Senate role once
@@ -498,6 +549,8 @@ class SchedulerCog(commands.Cog, name='SchedulerCog'):
                         guild, grant['grantor_discord_id'],
                         reason='the senator who guaranteed it is no longer in the Senate'
                     )
+                else:
+                    await self._restore_missing_write_role(guild, grant)
             else:
                 # Official grant: check WarEra write-level role
                 warera_data = warera_map.get(grant['grantor_warera_id'])
@@ -511,6 +564,23 @@ class SchedulerCog(commands.Cog, name='SchedulerCog'):
                         'lost write-level government role'
                     )
                     await self._revoke_grants_by_grantor(guild, grant['grantor_discord_id'])
+                else:
+                    await self._restore_missing_write_role(guild, grant)
+
+    async def _restore_missing_write_role(self, guild: discord.Guild, grant: dict):
+        """Re-apply the Discord write role for a grant if the grantee is missing it."""
+        grantee = guild.get_member(int(grant['grantee_discord_id']))
+        if not grantee:
+            return
+        write_role = guild.get_role(int(grant['write_role_id'])) if grant.get('write_role_id') else None
+        if not write_role:
+            return
+        if write_role not in grantee.roles:
+            try:
+                await grantee.add_roles(write_role, reason='Write audit: restoring missing write role for valid grant')
+                log.info('Restored missing write role for %s (grant from %s)', grantee, grant['grantor_discord_id'])
+            except Exception as e:
+                log.warning('_restore_missing_write_role: add_roles failed for %s: %s', grantee, e)
 
     async def _notify_upgrade_available(self, member: discord.Member, role_field: str):
         try:

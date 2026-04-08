@@ -18,7 +18,7 @@ import json
 import re as _re
 
 from country_flags import get_flag, country_channel_name
-from warera_api import get_user_lite, get_government_role, get_country_by_id, extract_user_id, CONGO_LOCAL_ROLES, CONGO_COUNTRY_ID, set_api_key, batch_get_user_lite
+from warera_api import get_user_lite, get_government_role, get_country_by_id, extract_user_id, CONGO_LOCAL_ROLES, CONGO_COUNTRY_ID, set_api_key, batch_get_user_lite, get_government_by_country_id, get_users_by_country, classify_player_build
 
 log = logging.getLogger(__name__)
 
@@ -179,6 +179,110 @@ class SetupApiKeyButton(discord.ui.View):
         await interaction.response.edit_message(content='⏭️ API key step skipped.', view=self)
 
 
+class SetupChannelSelect(discord.ui.View):
+    """Channel picker for the eco/war alert channel during /setup."""
+    def __init__(self, bot, user_id: int):
+        super().__init__(timeout=120)
+        self.bot = bot
+        self.user_id = user_id
+
+        select = discord.ui.ChannelSelect(
+            placeholder='Select alert channel for eco/war shift warnings…',
+            channel_types=[discord.ChannelType.text],
+            custom_id='setup_eco_war_channel',
+        )
+        select.callback = self._callback
+        self.add_item(select)
+
+        skip_btn = discord.ui.Button(label='Skip', style=discord.ButtonStyle.secondary)
+        skip_btn.callback = self._skip
+        self.add_item(skip_btn)
+
+    async def _callback(self, interaction: discord.Interaction):
+        if interaction.user.id != self.user_id:
+            await interaction.response.send_message('Not your setup.', ephemeral=True)
+            return
+        channel_id = str(interaction.data['values'][0])
+        await self.bot.db.set_guild_config(str(interaction.guild.id),
+                                           eco_war_alert_channel_id=channel_id)
+        for item in self.children:
+            item.disabled = True
+        await interaction.response.edit_message(
+            content='✅ Eco/war alert channel set.', view=self
+        )
+
+    async def _skip(self, interaction: discord.Interaction):
+        if interaction.user.id != self.user_id:
+            await interaction.response.send_message('Not your setup.', ephemeral=True)
+            return
+        for item in self.children:
+            item.disabled = True
+        await interaction.response.edit_message(
+            content='⏭️ Eco/war alert channel skipped.', view=self
+        )
+
+
+class SetupThresholdModal(discord.ui.Modal, title='Eco/War Alert Threshold'):
+    threshold = discord.ui.TextInput(
+        label='% change to trigger alert (1–100)',
+        placeholder='20',
+        required=False,
+        max_length=3,
+    )
+
+    def __init__(self, bot):
+        super().__init__()
+        self.bot = bot
+
+    async def on_submit(self, interaction: discord.Interaction):
+        raw = str(self.threshold.value).strip()
+        try:
+            val = max(1, min(100, int(raw))) if raw else 20
+        except ValueError:
+            val = 20
+        await self.bot.db.set_guild_config(str(interaction.guild_id), eco_war_threshold=val)
+        await interaction.response.edit_message(
+            content=f'✅ Eco/war alert threshold set to **{val}%**.', view=None
+        )
+
+
+class SetupThresholdButton(discord.ui.View):
+    def __init__(self, bot, user_id: int):
+        super().__init__(timeout=120)
+        self.bot = bot
+        self.user_id = user_id
+
+    @discord.ui.button(label='Set threshold', style=discord.ButtonStyle.primary, emoji='📊')
+    async def set_threshold(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if interaction.user.id != self.user_id:
+            await interaction.response.send_message('Not your setup.', ephemeral=True)
+            return
+        await interaction.response.send_modal(SetupThresholdModal(self.bot))
+
+    @discord.ui.button(label='Use default (20%)', style=discord.ButtonStyle.secondary)
+    async def use_default(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if interaction.user.id != self.user_id:
+            await interaction.response.send_message('Not your setup.', ephemeral=True)
+            return
+        await self.bot.db.set_guild_config(str(interaction.guild_id), eco_war_threshold=20)
+        for item in self.children:
+            item.disabled = True
+        await interaction.response.edit_message(
+            content='✅ Eco/war threshold set to default **20%**.', view=self
+        )
+
+    @discord.ui.button(label='Skip', style=discord.ButtonStyle.secondary)
+    async def skip(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if interaction.user.id != self.user_id:
+            await interaction.response.send_message('Not your setup.', ephemeral=True)
+            return
+        for item in self.children:
+            item.disabled = True
+        await interaction.response.edit_message(
+            content='⏭️ Eco/war threshold step skipped.', view=self
+        )
+
+
 # ── Admin Cog ─────────────────────────────────────────────────────────────────
 
 class AdminCog(commands.Cog, name='AdminCog'):
@@ -203,7 +307,7 @@ class AdminCog(commands.Cog, name='AdminCog'):
         categories = [c for c in guild.categories]
         roles = [r for r in guild.roles if not r.is_default() and not r.managed]
 
-        total_steps = 7 + len(CONGO_LOCAL_ROLES)
+        total_steps = 9 + len(CONGO_LOCAL_ROLES)
         await interaction.response.send_message(
             f'**Congo Bot Setup — Step 1/{total_steps}**\nSelect the category where **onboarding channels** will be created:',
             view=SetupCategorySelect(self.bot, interaction.user.id, 'onboarding', categories),
@@ -261,7 +365,7 @@ class AdminCog(commands.Cog, name='AdminCog'):
             )
         # Elders/Retirement role — optional, exempt from re-verification
         await interaction.followup.send(
-            f'**Step {total_steps - 1}/{total_steps}** — (Optional) Select the **Elders / Retirement role**.\n'
+            f'**Step {total_steps - 3}/{total_steps}** — (Optional) Select the **Elders / Retirement role**.\n'
             'Members with this role will be exempt from `/admin-reverify-government`.',
             view=SetupRoleSelect(
                 self.bot, interaction.user.id, 'Elders/Retirement', roles,
@@ -269,13 +373,31 @@ class AdminCog(commands.Cog, name='AdminCog'):
             ),
             ephemeral=True
         )
-        # Last step: optional WarEra API key (doubles rate limit to 200 req/min)
+        # Optional WarEra API key (doubles rate limit to 200 req/min)
         api_key_set = bool((await self.bot.db.get_guild_config(str(guild.id)) or {}).get('warera_api_key'))
         await interaction.followup.send(
-            f'**Step {total_steps}/{total_steps}** — (Optional) Set your **WarEra API key** '
+            f'**Step {total_steps - 2}/{total_steps}** — (Optional) Set your **WarEra API key** '
             f'to raise the rate limit from 100 to **200 requests/min**.\n'
             f'Current status: {"✅ API key is set" if api_key_set else "❌ No API key — anonymous limit (100 req/min)"}',
             view=SetupApiKeyButton(self.bot, interaction.user.id),
+            ephemeral=True
+        )
+        # Eco/war alert channel
+        await interaction.followup.send(
+            f'**Step {total_steps - 1}/{total_steps}** — (Optional) Select a **text channel** for '
+            f'eco/war shift alerts.\nThe bot will mention the Senate role here when a tracked '
+            f'country switches between eco and war builds.',
+            view=SetupChannelSelect(self.bot, interaction.user.id),
+            ephemeral=True
+        )
+        # Eco/war alert threshold
+        cur_config = await self.bot.db.get_guild_config(str(guild.id)) or {}
+        cur_threshold = cur_config.get('eco_war_threshold') or 20
+        await interaction.followup.send(
+            f'**Step {total_steps}/{total_steps}** — (Optional) Set the **eco/war alert threshold** '
+            f'(% of active players that must shift to trigger an alert).\n'
+            f'Current: **{cur_threshold}%**',
+            view=SetupThresholdButton(self.bot, interaction.user.id),
             ephemeral=True
         )
 
@@ -300,6 +422,8 @@ class AdminCog(commands.Cog, name='AdminCog'):
             ('local_role_defense_id',        'SETUP_LOCAL_ROLE_DEFENSE_ID'),
             ('local_role_congress_id',       'SETUP_LOCAL_ROLE_CONGRESS_ID'),
             ('elders_role_id',               'SETUP_ELDERS_ROLE_ID'),
+            ('eco_war_alert_channel_id',      'SETUP_ECO_WAR_ALERT_CHANNEL_ID'),
+            ('eco_war_threshold',             'SETUP_ECO_WAR_THRESHOLD'),
         ]
 
         lines = ['**Current guild config** (copy IDs into `.env` to survive database resets)\n```']
@@ -867,12 +991,12 @@ class AdminCog(commands.Cog, name='AdminCog'):
             return
 
         tracked = await self.bot.db.get_all_tracked_users(str(guild.id))
-        # Process citizens and all embassy members — sync_congo_local_roles checks
+        # Process citizens, embassy members, and visitors — sync_congo_local_roles checks
         # Congo country ID per role, so it's a no-op for non-Congolese members.
-        # Filtering by stored country_id here is unreliable (can be stale).
+        # Visitors who are Congo citizens/government officials also need syncing.
         eligible = [
             t for t in tracked
-            if t.get('assigned_role') in ('citizen', 'embassy')
+            if t.get('assigned_role') in ('citizen', 'embassy', 'visitor')
         ]
 
         # discord_id → set of db_keys the member was confirmed to qualify for
@@ -885,6 +1009,9 @@ class AdminCog(commands.Cog, name='AdminCog'):
         warera_results = await batch_get_user_lite(eligible_ids)
         warera_map = {uid: data for uid, data in zip(eligible_ids, warera_results) if data}
 
+        # Pre-fetch Congo government data once for all members in this run
+        congo_govt = await get_government_by_country_id(CONGO_COUNTRY_ID)
+
         updated, errors = 0, 0
         detail_lines: list[str] = []
         for t in eligible:
@@ -895,6 +1022,10 @@ class AdminCog(commands.Cog, name='AdminCog'):
             if not warera_data:
                 errors += 1
                 api_failed.add(str(t['discord_id']))
+                continue
+
+            # Skip visitors who are not Congo citizens — nothing to sync for them
+            if t.get('assigned_role') == 'visitor' and warera_data.get('country') != CONGO_COUNTRY_ID:
                 continue
 
             # Congolese embassy members also get the Citizen role — check live WarEra data
@@ -909,7 +1040,7 @@ class AdminCog(commands.Cog, name='AdminCog'):
                             pass
 
             added, removed_from_member, add_err, rem_err = await onboarding.sync_congo_local_roles(
-                guild, member, warera_data, config
+                guild, member, warera_data, config, govt_data=congo_govt
             )
             updated += 1
 
@@ -932,35 +1063,44 @@ class AdminCog(commands.Cog, name='AdminCog'):
                     f'➖ {member.mention}: removed {[r.name for r in removed_from_member]}'
                 )
 
-            # Record which roles this member legitimately holds
-            infos = warera_data.get('infos', {})
-            for warera_field, db_key, _ in CONGO_LOCAL_ROLES:
-                if infos.get(warera_field) == CONGO_COUNTRY_ID:
-                    qualified.setdefault(str(member.id), set()).add(db_key)
+            # Record which roles this member legitimately holds (use government endpoint
+            # data — CONGO_LOCAL_ROLES uses government field names, not getUserLite.infos)
+            user_id = warera_data.get('_id', '')
+            if user_id and congo_govt:
+                for gf, db_key, _ in CONGO_LOCAL_ROLES:
+                    val = congo_govt.get(gf)
+                    if val is None:
+                        continue
+                    has_role = (user_id in val) if isinstance(val, list) else (val == user_id)
+                    if has_role:
+                        qualified.setdefault(str(member.id), set()).add(db_key)
 
         # Second pass: strip government roles from anyone who currently holds one
         # but was not confirmed as a qualifying citizen above.
+        # Skip entirely if the government API was unavailable to avoid stripping roles
+        # when we can't verify membership.
         removed = 0
-        for _, db_key, display_name in CONGO_LOCAL_ROLES:
-            role_id = config.get(db_key)
-            if not role_id:
-                continue
-            discord_role = guild.get_role(int(role_id))
-            if not discord_role:
-                continue
-            for m in list(discord_role.members):
-                mid = str(m.id)
-                if mid in api_failed:
+        if congo_govt is not None:
+            for _, db_key, display_name in CONGO_LOCAL_ROLES:
+                role_id = config.get(db_key)
+                if not role_id:
                     continue
-                if db_key in qualified.get(mid, set()):
+                discord_role = guild.get_role(int(role_id))
+                if not discord_role:
                     continue
-                try:
-                    await m.remove_roles(
-                        discord_role, reason=f'Local role audit: does not qualify for Congo {display_name}'
-                    )
-                    removed += 1
-                except Exception as e:
-                    detail_lines.append(f'⚠️ {m.mention}: failed to remove `{discord_role.name}` — `{e}`')
+                for m in list(discord_role.members):
+                    mid = str(m.id)
+                    if mid in api_failed:
+                        continue
+                    if db_key in qualified.get(mid, set()):
+                        continue
+                    try:
+                        await m.remove_roles(
+                            discord_role, reason=f'Local role audit: does not qualify for Congo {display_name}'
+                        )
+                        removed += 1
+                    except Exception as e:
+                        detail_lines.append(f'⚠️ {m.mention}: failed to remove `{discord_role.name}` — `{e}`')
 
         parts = [f'✅ Synced Congolese government roles for **{updated}** member(s).']
         if removed:
@@ -1017,7 +1157,21 @@ class AdminCog(commands.Cog, name='AdminCog'):
         infos = warera_data.get('infos') or {}
         lines.append(f'**WarEra infos:** `{infos}`')
 
-        # Per-role diagnosis
+        # Per-role diagnosis — fetch government API (same source as sync_congo_local_roles)
+        warera_id = warera_data.get('_id', '')
+        congo_govt = await get_government_by_country_id(CONGO_COUNTRY_ID)
+        if congo_govt is None:
+            lines.append('\n⚠️ **Government API unavailable** — role check below uses user infos only (may be inaccurate)')
+
+        _GOVT_TO_INFOS = {
+            'president': 'presidentOf',
+            'vicePresident': 'vicePresidentOf',
+            'minOfForeignAffairs': 'minOfForeignAffairsOf',
+            'minOfEconomy': 'minOfEconomyOf',
+            'minOfDefense': 'minOfDefenseOf',
+            'congressMembers': 'congressMemberOf',
+        }
+
         lines.append('\n**Local role check:**')
         for warera_field, db_key, display_name in CONGO_LOCAL_ROLES:
             role_id = config.get(db_key)
@@ -1028,17 +1182,155 @@ class AdminCog(commands.Cog, name='AdminCog'):
             if not discord_role:
                 lines.append(f'  ⚠️ **{display_name}**: role ID `{role_id}` no longer exists in Discord')
                 continue
-            field_value = infos.get(warera_field)
-            has_warera_role = (field_value == CONGO_COUNTRY_ID)
+
+            # Check via government API (matches sync_congo_local_roles logic)
+            govt_val = (congo_govt or {}).get(warera_field)
+            if isinstance(govt_val, list):
+                has_warera_role = bool(warera_id) and warera_id in govt_val
+            else:
+                has_warera_role = bool(warera_id) and govt_val == warera_id
+
+            # Also show the user's infos field for context
+            infos_field = _GOVT_TO_INFOS.get(warera_field, warera_field)
+            infos_value = infos.get(infos_field)
+
             has_discord_role = discord_role in member.roles
             status = '✅' if has_warera_role == has_discord_role else '❌ mismatch'
             lines.append(
                 f'  {status} **{display_name}**: '
-                f'WarEra `{warera_field}`=`{field_value}` → has_role={has_warera_role} | '
+                f'WarEra `{infos_field}`=`{infos_value}` → has_role={has_warera_role} | '
                 f'Discord role present={has_discord_role}'
             )
 
         await interaction.followup.send('\n'.join(lines), ephemeral=True)
+
+    # ── /admin-eco-status ────────────────────────────────────────────────────
+
+    @app_commands.command(
+        name='admin-eco-status',
+        description='[Admin] Show current eco/war/hybrid build breakdown for a tracked country.'
+    )
+    @app_commands.default_permissions(administrator=True)
+    @app_commands.describe(country_id='WarEra country ID (24-char hex)')
+    async def admin_eco_status(self, interaction: discord.Interaction, country_id: str):
+        if not await self._is_senate(interaction):
+            await interaction.response.send_message('No permission.', ephemeral=True)
+            return
+        await interaction.response.defer(ephemeral=True)
+
+        existing = await self.bot.db.get_tracked_country(country_id)
+        country_name = (existing.get('country_name') if existing else None) or country_id
+        country_flag = (existing.get('country_flag') if existing else None) or ''
+
+        await interaction.followup.send(
+            f'Fetching skill data for **{country_name} {country_flag}**… this may take a moment.',
+            ephemeral=True
+        )
+
+        # Paginate all users in this country
+        all_items, cursor = [], None
+        while True:
+            page = await get_users_by_country(country_id, cursor)
+            if not page:
+                break
+            items = (
+                page.get('items')
+                or (page.get('json') or {}).get('items')
+                or []
+            )
+            all_items.extend(items)
+            cursor = (
+                page.get('nextCursor')
+                or (page.get('json') or {}).get('nextCursor')
+            )
+            if not cursor:
+                break
+
+        if not all_items:
+            await interaction.followup.send(
+                f'Could not fetch users for `{country_id}`.', ephemeral=True
+            )
+            return
+
+        from datetime import datetime, timedelta
+        from cogs.tracker import _parse_last_online, ACTIVE_MIN_LEVEL
+
+        user_ids = []
+        seen: set = set()
+        uid_map = {}
+        for u in all_items:
+            uid = u.get('_id') or u.get('id') or u.get('userId')
+            if uid and uid not in seen:
+                seen.add(uid)
+                user_ids.append(uid)
+                uid_map[uid] = u
+
+        results = await batch_get_user_lite(user_ids)
+
+        now_utc = datetime.utcnow()
+        active_threshold = now_utc - timedelta(days=7)
+        new_threshold = now_utc - timedelta(days=4)
+        eco = war = hybrid = uncategorized = skipped = 0
+
+        for uid, r in zip(user_ids, results):
+            if not isinstance(r, dict):
+                continue
+            created_ts = _parse_last_online((uid_map.get(uid) or {}).get('createdAt'))
+            if created_ts and created_ts > new_threshold:
+                skipped += 1
+                continue
+            ts = _parse_last_online((r.get('dates') or {}).get('lastConnectionAt'))
+            if created_ts and ts and now_utc - created_ts > timedelta(days=4) and ts - created_ts <= timedelta(hours=48):
+                skipped += 1
+                continue
+            level = (r.get('leveling') or {}).get('level')
+            if not ts or ts < active_threshold or level is None or level <= ACTIVE_MIN_LEVEL:
+                continue
+            build = classify_player_build(r.get('skills') or {})
+            if build == 'eco':
+                eco += 1
+            elif build == 'war':
+                war += 1
+            elif build == 'hybrid':
+                hybrid += 1
+            else:
+                uncategorized += 1
+
+        active = eco + war + hybrid + uncategorized
+        if active == 0:
+            await interaction.followup.send(
+                f'No active players found for **{country_name} {country_flag}**.',
+                ephemeral=True
+            )
+            return
+
+        eco_pct    = eco    / active * 100
+        war_pct    = war    / active * 100
+        hybrid_pct = hybrid / active * 100
+
+        # Last stored snapshot for comparison
+        guild_id = str(interaction.guild.id)
+        prev = await self.bot.db.get_last_eco_war_snapshot(guild_id, country_id)
+        prev_line = ''
+        if prev and prev['active_players']:
+            p = prev['active_players']
+            prev_line = (
+                f'\n*Previous snapshot ({prev["snapshot_time"][:16]}):* '
+                f'🌱 {prev["eco_count"]/p*100:.0f}% '
+                f'⚔️ {prev["war_count"]/p*100:.0f}% '
+                f'🔀 {prev["hybrid_count"]/p*100:.0f}%'
+            )
+
+        await interaction.followup.send(
+            f'**Eco/War status — {country_name} {country_flag}**\n'
+            f'Active players: **{active}** (skipped new/ghost: {skipped})\n'
+            f'🌱 Eco:    **{eco_pct:.0f}%** ({eco})\n'
+            f'⚔️ War:    **{war_pct:.0f}%** ({war})\n'
+            f'🔀 Hybrid: **{hybrid_pct:.0f}%** ({hybrid})\n'
+            f'❓ Uncategorized: {uncategorized}'
+            f'{prev_line}',
+            ephemeral=True
+        )
 
     @app_commands.command(name='backup-db', description='[Admin] Force an immediate database backup.')
     @app_commands.default_permissions(administrator=True)

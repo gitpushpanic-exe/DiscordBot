@@ -133,6 +133,21 @@ CREATE TABLE IF NOT EXISTS activity_snapshots (
 
 CREATE INDEX IF NOT EXISTS idx_snapshots_country_time
     ON activity_snapshots (country_id, snapshot_time);
+
+CREATE TABLE IF NOT EXISTS eco_war_snapshots (
+    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+    guild_id            TEXT NOT NULL,
+    country_id          TEXT NOT NULL,
+    snapshot_time       TEXT NOT NULL,
+    active_players      INTEGER NOT NULL DEFAULT 0,
+    eco_count           INTEGER NOT NULL DEFAULT 0,
+    war_count           INTEGER NOT NULL DEFAULT 0,
+    hybrid_count        INTEGER NOT NULL DEFAULT 0,
+    uncategorized_count INTEGER NOT NULL DEFAULT 0
+);
+
+CREATE INDEX IF NOT EXISTS idx_eco_war_country
+    ON eco_war_snapshots (guild_id, country_id, snapshot_time DESC);
 """
 
 
@@ -186,6 +201,11 @@ class Database:
                 await db.execute('ALTER TABLE guild_config ADD COLUMN elders_role_id TEXT')
             except Exception:
                 pass  # Column already exists
+            for col in ('eco_war_alert_channel_id TEXT', 'eco_war_threshold INTEGER'):
+                try:
+                    await db.execute(f'ALTER TABLE guild_config ADD COLUMN {col}')
+                except Exception:
+                    pass  # Column already exists
             await db.commit()
 
     async def backup(self):
@@ -651,6 +671,36 @@ class Database:
             )
             await db.commit()
             return cur.rowcount
+
+    # ── Eco/War Snapshots ─────────────────────────────────────────────────────
+
+    async def save_eco_war_snapshot(
+        self, guild_id: str, country_id: str, snapshot_time: str,
+        active_players: int, eco_count: int, war_count: int,
+        hybrid_count: int, uncategorized_count: int
+    ):
+        async with aiosqlite.connect(self.db_path) as db:
+            await db.execute(
+                """INSERT INTO eco_war_snapshots
+                   (guild_id, country_id, snapshot_time,
+                    active_players, eco_count, war_count, hybrid_count, uncategorized_count)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                (guild_id, country_id, snapshot_time,
+                 active_players, eco_count, war_count, hybrid_count, uncategorized_count)
+            )
+            await db.commit()
+
+    async def get_last_eco_war_snapshot(self, guild_id: str, country_id: str) -> Optional[Dict]:
+        async with aiosqlite.connect(self.db_path) as db:
+            db.row_factory = aiosqlite.Row
+            async with db.execute(
+                """SELECT * FROM eco_war_snapshots
+                   WHERE guild_id = ? AND country_id = ?
+                   ORDER BY snapshot_time DESC LIMIT 1""",
+                (guild_id, country_id)
+            ) as cur:
+                row = await cur.fetchone()
+                return dict(row) if row else None
 
     async def get_activity_snapshots(self, country_id: str, since_days: int = 30) -> List[Dict]:
         async with aiosqlite.connect(self.db_path) as db:

@@ -15,7 +15,7 @@ import numpy as np
 from discord import app_commands
 from discord.ext import commands, tasks
 
-from warera_api import get_users_by_country, get_user_lite, get_country_by_id, batch_get_user_lite
+from warera_api import get_users_by_country, get_user_lite, get_country_by_id, batch_get_user_lite, classify_player_build
 
 log = logging.getLogger(__name__)
 
@@ -111,15 +111,15 @@ class TrackerCog(commands.Cog, name='TrackerCog'):
         if not countries:
             return
         await asyncio.gather(
-            *[self._safe_snapshot(c['country_id']) for c in countries],
+            *[self._safe_snapshot(c) for c in countries],
             return_exceptions=True
         )
 
-    async def _safe_snapshot(self, country_id: str):
+    async def _safe_snapshot(self, country: dict):
         try:
-            await self._snapshot_country(country_id)
+            await self._snapshot_country(country)
         except Exception as e:
-            log.error('Tracker: snapshot failed for %s: %s', country_id, e)
+            log.error('Tracker: snapshot failed for %s: %s', country.get('country_id'), e)
 
     @poll_countries.before_loop
     async def before_poll(self):
@@ -127,8 +127,12 @@ class TrackerCog(commands.Cog, name='TrackerCog'):
 
     # ── Snapshot logic ────────────────────────────────────────────────────────
 
-    async def _snapshot_country(self, country_id: str):
-        """Paginate all users in country, extract online status + level, store snapshot."""
+    async def _snapshot_country(self, country: dict):
+        """Paginate all users in country, extract online status + level, store snapshot.
+        Also classifies active players as eco/war/hybrid and fires an alert if the
+        war-player ratio shifts by more than the configured threshold."""
+        country_id = country['country_id'] if isinstance(country, dict) else country
+        guild_id = country.get('guild_id') if isinstance(country, dict) else None
         # 1. Paginate getUsersByCountry — collect all user items
         all_items = []
         cursor = None
@@ -193,6 +197,7 @@ class TrackerCog(commands.Cog, name='TrackerCog'):
         counts = {'low': 0, 'mid': 0, 'high': 0, 'master': 0}
         online_total = 0
         active_count = 0
+        eco_count = war_count = hybrid_count = uncategorized_count = 0
 
         for uid, r in zip(user_ids, results):
             if not isinstance(r, dict):
@@ -212,6 +217,16 @@ class TrackerCog(commands.Cog, name='TrackerCog'):
             level = leveling.get('level') if isinstance(leveling, dict) else None
             if ts and ts > active_threshold and level is not None and level > ACTIVE_MIN_LEVEL:
                 active_count += 1
+                # Classify eco/war build for active players
+                build = classify_player_build(r.get('skills') or {})
+                if build == 'eco':
+                    eco_count += 1
+                elif build == 'war':
+                    war_count += 1
+                elif build == 'hybrid':
+                    hybrid_count += 1
+                else:
+                    uncategorized_count += 1
             if ts and ts > online_threshold:
                 online_total += 1
                 bracket = _level_bracket(level)
@@ -225,10 +240,65 @@ class TrackerCog(commands.Cog, name='TrackerCog'):
             counts['low'], counts['mid'], counts['high'], counts['master'],
             active_users=active_count
         )
+
+        # 5. Store eco/war snapshot and fire alert on significant shift
+        active_classified = eco_count + war_count + hybrid_count + uncategorized_count
+        if guild_id and active_classified > 0:
+            # Fetch previous snapshot BEFORE saving the new one for comparison
+            prev = await self.bot.db.get_last_eco_war_snapshot(guild_id, country_id)
+            await self.bot.db.save_eco_war_snapshot(
+                guild_id, country_id, now,
+                active_classified, eco_count, war_count, hybrid_count, uncategorized_count
+            )
+            if prev and prev['active_players']:
+                config = await self.bot.db.get_guild_config(guild_id)
+                alert_ch_id = (config or {}).get('eco_war_alert_channel_id')
+                if alert_ch_id:
+                    threshold = int((config or {}).get('eco_war_threshold') or 20)
+                    prev_war_pct = prev['war_count'] / prev['active_players'] * 100
+                    curr_war_pct = war_count / active_classified * 100
+                    delta = curr_war_pct - prev_war_pct
+                    if abs(delta) >= threshold:
+                        guild_obj = self.bot.get_guild(int(guild_id))
+                        alert_channel = guild_obj.get_channel(int(alert_ch_id)) if guild_obj else None
+                        if alert_channel:
+                            senate_id = (config or {}).get('senate_role_id')
+                            mention = f'<@&{senate_id}> ' if senate_id else ''
+                            country_name = (
+                                country.get('country_name', country_id)
+                                if isinstance(country, dict) else country_id
+                            )
+                            flag = country.get('country_flag', '') if isinstance(country, dict) else ''
+                            direction = '⚔️ **ECO → WAR**' if delta > 0 else '🌱 **WAR → ECO**'
+                            prev_eco_pct    = prev['eco_count']    / prev['active_players'] * 100
+                            prev_hybrid_pct = prev['hybrid_count'] / prev['active_players'] * 100
+                            curr_eco_pct    = eco_count    / active_classified * 100
+                            curr_hybrid_pct = hybrid_count / active_classified * 100
+                            try:
+                                await alert_channel.send(
+                                    f'{mention}⚠️ {direction} shift detected — '
+                                    f'**{country_name} {flag}**\n'
+                                    f'Active players: {active_classified} '
+                                    f'(was {prev["active_players"]})\n'
+                                    f'🌱 Eco:    {prev_eco_pct:.0f}% → {curr_eco_pct:.0f}%\n'
+                                    f'⚔️ War:    {prev_war_pct:.0f}% → {curr_war_pct:.0f}%'
+                                    f'  ({delta:+.0f}%)\n'
+                                    f'🔀 Hybrid: {prev_hybrid_pct:.0f}% → {curr_hybrid_pct:.0f}%'
+                                )
+                            except Exception as e:
+                                log.warning('Tracker: eco/war alert failed for %s: %s', country_id, e)
+        elif guild_id and active_classified == 0:
+            await self.bot.db.save_eco_war_snapshot(
+                guild_id, country_id, now,
+                0, 0, 0, 0, 0
+            )
+
         log.info(
-            'Tracker: %s — %d/%d online, %d active (%d raw) (low=%d mid=%d high=%d master=%d)',
+            'Tracker: %s — %d/%d online, %d active (%d raw) (low=%d mid=%d high=%d master=%d) '
+            'eco=%d war=%d hybrid=%d',
             country_id, online_total, total_users, active_count, len(all_items),
-            counts['low'], counts['mid'], counts['high'], counts['master']
+            counts['low'], counts['mid'], counts['high'], counts['master'],
+            eco_count, war_count, hybrid_count
         )
         return total_users, online_total, counts, active_count
 
@@ -562,7 +632,9 @@ class TrackerCog(commands.Cog, name='TrackerCog'):
             flag = existing.get('country_flag') or ''
 
         try:
-            total, online, counts, active = await self._snapshot_country(country_id)
+            total, online, counts, active = await self._snapshot_country(
+                existing or {'country_id': country_id}
+            )
         except Exception as e:
             await interaction.followup.send(
                 f'Snapshot failed: {e}', ephemeral=True
