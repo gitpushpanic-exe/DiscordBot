@@ -167,6 +167,9 @@ DB_PATH=data/congobot.db
 You can also pre-seed the bot configuration via environment variables. These are used as fallback values if the database is ever lost — they never overwrite values already in the database:
 
 ```env
+# Home country (WarEra country ID — name and flag are auto-fetched from WarEra on first start)
+SETUP_HOME_COUNTRY_ID=
+
 # Core setup
 SETUP_ONBOARDING_CATEGORY_ID=
 SETUP_EMBASSY_CATEGORY_ID=
@@ -219,16 +222,17 @@ docker compose down
 
 Once the bot is online, run `/setup` in your server (requires Administrator permission). The wizard walks you through these steps:
 
-1. **Onboarding category** — where private onboarding channels are created
-2. **Embassy category** — where embassy channels are created
-3. **Senate role** — members with this role can run admin/senate commands
-4. **Visitor role** — assigned to verified visitors
-5. **Citizen role** — assigned to verified Congo citizens
-6–11. **Congo government roles** — local Discord roles for President, VP, MoFA, Economy, Defense, Congress
-12. **Elders/Retirement role** *(optional)* — exempt from `/admin-reverify-government`
-13. **WarEra API key** *(optional)* — raises the rate limit from 100 to 200 req/min
-14. **Eco/war alert channel** *(optional)* — text channel where eco/war shift alerts are posted
-15. **Eco/war alert threshold** *(optional)* — % of active players that must shift to trigger an alert (default: 20%)
+1. **Home country** — enter your WarEra country ID (24-char hex); the bot fetches the name and flag automatically
+2. **Onboarding category** — where private onboarding channels are created
+3. **Embassy category** — where embassy channels are created
+4. **Senate role** — members with this role can run admin/senate commands
+5. **Visitor role** — assigned to verified visitors
+6. **Citizen role** — assigned to verified home-country citizens
+7–12. **Home-country government roles** — local Discord roles for President, VP, MoFA, Economy, Defense, Congress
+13. **Elders/Retirement role** *(optional)* — exempt from `/admin-reverify-government`
+14. **WarEra API key** *(optional)* — raises the rate limit from 100 to 200 req/min
+15. **Eco/war alert channel** *(optional)* — text channel where eco/war shift alerts are posted
+16. **Eco/war alert threshold** *(optional)* — % of active players that must shift to trigger an alert (default: 20%)
 
 After completing `/setup`, the bot is fully operational.
 

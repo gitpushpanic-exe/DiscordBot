@@ -22,7 +22,10 @@ CREATE TABLE IF NOT EXISTS guild_config (
     local_role_defense_id TEXT,
     local_role_congress_id TEXT,
     warera_api_key TEXT,
-    elders_role_id TEXT
+    elders_role_id TEXT,
+    home_country_id TEXT,
+    home_country_name TEXT,
+    home_country_flag TEXT
 );
 
 CREATE TABLE IF NOT EXISTS user_requests (
@@ -206,6 +209,11 @@ class Database:
                     await db.execute(f'ALTER TABLE guild_config ADD COLUMN {col}')
                 except Exception:
                     pass  # Column already exists
+            for col in ('home_country_id TEXT', 'home_country_name TEXT', 'home_country_flag TEXT'):
+                try:
+                    await db.execute(f'ALTER TABLE guild_config ADD COLUMN {col}')
+                except Exception:
+                    pass  # Column already exists
             await db.commit()
 
     async def backup(self):
@@ -261,13 +269,14 @@ class Database:
 
     async def create_user_request(self, discord_id: str, guild_id: str, channel_id: str,
                                    requested_role: str = None):
+        initial_status = 'awaiting_warera_id' if requested_role else 'pending'
         async with aiosqlite.connect(self.db_path) as db:
             await db.execute(
                 """INSERT OR REPLACE INTO user_requests
                    (discord_id, guild_id, channel_id, requested_role, status,
                     created_at, last_activity_at)
-                   VALUES (?, ?, ?, ?, 'awaiting_warera_id', datetime('now'), datetime('now'))""",
-                (discord_id, guild_id, channel_id, requested_role)
+                   VALUES (?, ?, ?, ?, ?, datetime('now'), datetime('now'))""",
+                (discord_id, guild_id, channel_id, requested_role, initial_status)
             )
             await db.commit()
 

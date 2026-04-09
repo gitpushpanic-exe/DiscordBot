@@ -50,7 +50,6 @@ class CongoBot(commands.Bot):
 
     async def on_ready(self):
         log.info(f'Logged in as {self.user} (ID: {self.user.id})')
-        await self.change_presence(activity=discord.Game(name='Guarding Congo 🇨🇬'))
         await self._seed_guild_config()
         # Apply stored API key so all warera_api calls use it immediately
         config = await self.db.get_guild_config(str(self.guild_id))
@@ -58,6 +57,10 @@ class CongoBot(commands.Bot):
             from warera_api import set_api_key
             set_api_key(config['warera_api_key'])
             log.info('WarEra API key loaded from guild config')
+        # Set bot status using the configured home country
+        name = (config or {}).get('home_country_name') or 'WarEra'
+        flag = (config or {}).get('home_country_flag') or ''
+        await self.change_presence(activity=discord.Game(name=f'Guarding {name} {flag}'.strip()))
 
     async def _seed_guild_config(self):
         """
@@ -80,6 +83,7 @@ class CongoBot(commands.Bot):
             'local_role_congress_id':       os.getenv('SETUP_LOCAL_ROLE_CONGRESS_ID'),
             'elders_role_id':               os.getenv('SETUP_ELDERS_ROLE_ID'),
             'warera_api_key':               os.getenv('WARERA_API_KEY'),
+            'home_country_id':              os.getenv('SETUP_HOME_COUNTRY_ID'),
         }
         # Drop empty/unset entries
         seed = {k: v for k, v in seed.items() if v}
@@ -92,6 +96,23 @@ class CongoBot(commands.Bot):
         if to_set:
             await self.db.set_guild_config(guild_id, **to_set)
             log.info('Seeded guild_config from env: %s', list(to_set.keys()))
+
+        # Auto-fill home country name/flag from WarEra if only the ID is known
+        config = await self.db.get_guild_config(guild_id) or {}
+        if config.get('home_country_id') and not config.get('home_country_name'):
+            try:
+                from warera_api import get_country_by_id
+                from country_flags import get_flag
+                country_data = await get_country_by_id(config['home_country_id'])
+                if country_data:
+                    c_name = country_data.get('name', '')
+                    c_flag = get_flag(country_data.get('name', ''))
+                    await self.db.set_guild_config(guild_id,
+                                                   home_country_name=c_name,
+                                                   home_country_flag=c_flag)
+                    log.info('Auto-filled home country name/flag: %s %s', c_name, c_flag)
+            except Exception as e:
+                log.warning('Could not auto-fill home country name/flag: %s', e)
 
     async def on_member_join(self, member: discord.Member):
         if member.guild.id != self.guild_id:

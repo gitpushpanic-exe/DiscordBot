@@ -25,12 +25,10 @@ from warera_api import (
     extract_user_id, get_user_lite, get_country_by_id,
     get_company_names, get_government_role, get_government_role_from_govt_data,
     role_display_name, get_all_roles_display,
-    get_government_by_country_id, CONGO_LOCAL_ROLES
+    get_government_by_country_id, LOCAL_ROLES
 )
 
 log = logging.getLogger(__name__)
-
-CONGO_COUNTRY_ID = '6873d0ea1758b40e712b5f4c'
 CHANNEL_DELETE_HOURS = 1
 
 _TOKEN_WORDS = [
@@ -308,8 +306,10 @@ class OnboardingCog(commands.Cog, name='OnboardingCog'):
 
         await self.bot.db.create_user_request(str(member.id), str(guild.id), str(channel.id))
 
+        home_name = config.get('home_country_name') or 'our community'
+        home_flag = config.get('home_country_flag') or ''
         embed = discord.Embed(
-            title='Welcome to Congo! 🇨🇬',
+            title=f'Welcome to {home_name}! {home_flag}'.strip(),
             description=(
                 f'Hello {member.mention}!\n\n'
                 'Please select the role that best describes you to get started.'
@@ -438,11 +438,15 @@ class OnboardingCog(commands.Cog, name='OnboardingCog'):
     async def start_citizen(self, channel: discord.TextChannel,
                              member: discord.Member, warera_data: dict):
         guild = channel.guild
-        if warera_data.get('country') != CONGO_COUNTRY_ID:
+        config = await self.bot.db.get_guild_config(str(guild.id)) or {}
+        home_country_id   = config.get('home_country_id') or ''
+        home_country_name = config.get('home_country_name') or 'your home country'
+
+        if home_country_id and warera_data.get('country') != home_country_id:
             embed = discord.Embed(
-                title='❌ Not a Congo Citizen',
+                title=f'❌ Not a {home_country_name} Citizen',
                 description=(
-                    'Your WarEra citizenship is not with **Congo**.\n\n'
+                    f'Your WarEra citizenship is not with **{home_country_name}**.\n\n'
                     'You will be registered as a **Visitor** instead.'
                 ),
                 color=discord.Color.red()
@@ -461,7 +465,7 @@ class OnboardingCog(commands.Cog, name='OnboardingCog'):
         embed = discord.Embed(
             title='🏢 Company Name Verification',
             description=(
-                'To verify your **Congo citizenship**, rename one of your companies in WarEra to:\n\n'
+                f'To verify your **{home_country_name} citizenship**, rename one of your companies in WarEra to:\n\n'
                 f'# `{token}`\n\n'
                 'The bot checks every minute automatically.\n'
                 'You can also send any message here to trigger an immediate check.\n\n'
@@ -504,17 +508,17 @@ class OnboardingCog(commands.Cog, name='OnboardingCog'):
             str(citizen_role.id) if citizen_role else None
         )
 
-        # Assign any Congolese government roles this citizen currently holds in WarEra
+        # Assign any home-country government roles this citizen currently holds in WarEra
         warera_data = await get_user_lite(request['warera_id'])
         if warera_data:
-            await self.sync_congo_local_roles(guild, member, warera_data, config)
+            await self.sync_local_roles(guild, member, warera_data, config)
 
         await self._schedule_deletion(channel)
 
         embed = discord.Embed(
             title='✅ Citizenship Verified!',
             description=(
-                f'Welcome home, **{username}**! 🇨🇬\n\n'
+                f'Welcome home, **{username}**! {config.get("home_country_flag") or ""}\n\n'
                 'You have been granted **Citizen** status.\n\n'
                 f'This channel will be deleted in {CHANNEL_DELETE_HOURS} hours.'
             ),
@@ -642,9 +646,13 @@ class OnboardingCog(commands.Cog, name='OnboardingCog'):
             country_id, str(base_role.id)
         )
 
-        # Congolese embassy members also receive the Citizen role
-        if country_id == CONGO_COUNTRY_ID:
+        # Home-country embassy members also receive the Citizen role + government Discord roles
+        home_cid = (config or {}).get('home_country_id')
+        if home_cid and country_id == home_cid:
             await self._assign_role(guild, member, config, 'citizen_role_id')
+            warera_data_fresh = await get_user_lite(request['warera_id'])
+            if warera_data_fresh:
+                await self.sync_local_roles(guild, member, warera_data_fresh, config)
 
         await self._schedule_deletion(channel)
 
@@ -756,10 +764,12 @@ class OnboardingCog(commands.Cog, name='OnboardingCog'):
                                          member: discord.Member, warera_data: dict):
         """Start the company-rename step for a government re-verification."""
         guild = channel.guild
+        config = await self.bot.db.get_guild_config(str(guild.id)) or {}
+        home_country_id = config.get('home_country_id') or ''
         user_warera_id = warera_data.get('_id', '')
-        govt_data = await get_government_by_country_id(CONGO_COUNTRY_ID)
+        govt_data = await get_government_by_country_id(home_country_id)
         role_field, _, _ = get_government_role_from_govt_data(
-            user_warera_id, CONGO_COUNTRY_ID, govt_data or {}
+            user_warera_id, home_country_id, govt_data or {}
         )
         if not role_field:
             await channel.send(
@@ -882,29 +892,30 @@ class OnboardingCog(commands.Cog, name='OnboardingCog'):
             return True
         return False
 
-    # ── Congo local government role helpers ───────────────────────────────────
+    # ── Home-country local government role helpers ────────────────────────────
 
-    async def sync_congo_local_roles(
+    async def sync_local_roles(
         self, guild: discord.Guild, member: discord.Member,
         warera_data: dict, config: dict, govt_data: dict = None
     ):
         """
-        Assign or remove the configured Congolese government Discord roles for a citizen
+        Assign or remove the configured home-country government Discord roles for a citizen
         based on the live government.getByCountryId response.  Pass a pre-fetched govt_data
         dict to avoid a redundant API call when syncing many members at once.
         If the government endpoint is unavailable (returns None), the sync is skipped
         entirely so that existing roles are never stripped due to an API failure.
         """
+        home_country_id = config.get('home_country_id') or ''
         if govt_data is None:
-            govt_data = await get_government_by_country_id(CONGO_COUNTRY_ID)
+            govt_data = await get_government_by_country_id(home_country_id)
         if govt_data is None:
-            log.warning('sync_congo_local_roles: government API unavailable, skipping sync for %s', member)
+            log.warning('sync_local_roles: government API unavailable, skipping sync for %s', member)
             return [], [], None, None
 
         user_id = warera_data.get('_id', '')
         to_add = []
         to_remove = []
-        for govt_field, db_key, _ in CONGO_LOCAL_ROLES:
+        for govt_field, db_key, _ in LOCAL_ROLES:
             role_id = config.get(db_key) if config else None
             if not role_id:
                 continue
@@ -921,30 +932,30 @@ class OnboardingCog(commands.Cog, name='OnboardingCog'):
         remove_error = None
         if to_add:
             try:
-                await member.add_roles(*to_add, reason='WarEra: Congo government roles synced')
+                await member.add_roles(*to_add, reason='WarEra: local government roles synced')
             except Exception as e:
                 add_error = str(e)
-                log.warning('sync_congo_local_roles: add_roles failed for %s: %s', member, e)
+                log.warning('sync_local_roles: add_roles failed for %s: %s', member, e)
         if to_remove:
             try:
-                await member.remove_roles(*to_remove, reason='WarEra: Congo government roles synced')
+                await member.remove_roles(*to_remove, reason='WarEra: local government roles synced')
             except Exception as e:
                 remove_error = str(e)
-                log.warning('sync_congo_local_roles: remove_roles failed for %s: %s', member, e)
+                log.warning('sync_local_roles: remove_roles failed for %s: %s', member, e)
         return to_add, to_remove, add_error, remove_error
 
-    async def remove_all_congo_local_roles(
+    async def remove_all_local_roles(
         self, guild: discord.Guild, member: discord.Member, config: dict
     ):
-        """Strip all configured Congolese government roles from a member."""
-        for _, db_key, _ in CONGO_LOCAL_ROLES:
+        """Strip all configured home-country government roles from a member."""
+        for _, db_key, _ in LOCAL_ROLES:
             role_id = config.get(db_key) if config else None
             if not role_id:
                 continue
             discord_role = guild.get_role(int(role_id))
             if discord_role and discord_role in member.roles:
                 try:
-                    await member.remove_roles(discord_role, reason='No longer a Congo citizen')
+                    await member.remove_roles(discord_role, reason='No longer a home country citizen')
                 except discord.Forbidden:
                     pass
 

@@ -146,8 +146,6 @@ async def get_company_names(user_id: str) -> List[str]:
     return names
 
 
-CONGO_COUNTRY_ID = '6873d0ea1758b40e712b5f4c'
-
 # Skill keys from getUserLite that are considered economic (eco) builds.
 # All other skills (attack, armor, criticalChance, etc.) are war skills.
 ECO_SKILLS = frozenset({'entrepreneurship', 'energy', 'production', 'companies', 'management'})
@@ -180,11 +178,12 @@ def classify_player_build(skills: dict) -> str:
         return 'war'
     return 'hybrid'
 
-# Mapping of (govt_field, db_config_key, display_name) for Congolese government roles.
+# Mapping of (govt_field, db_config_key, display_name) for home-country government roles.
 # govt_field matches the keys from government.getByCountryId:
 #   president/vicePresident/minOf* → single user-ID string
 #   congressMembers                → list of user-ID strings
-CONGO_LOCAL_ROLES = [
+# The WarEra government structure is universal — the same fields apply to every country.
+LOCAL_ROLES = [
     ('president',          'local_role_president_id',       'President'),
     ('vicePresident',      'local_role_vice_president_id',  'Vice President'),
     ('minOfForeignAffairs','local_role_mfa_id',             'Minister of Foreign Affairs'),

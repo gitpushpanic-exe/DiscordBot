@@ -13,11 +13,9 @@ import discord
 from discord.ext import commands, tasks
 
 from country_flags import get_flag
-from warera_api import get_user_lite, get_government_role, get_government_role_from_govt_data, role_display_name, get_country_by_id, CONGO_LOCAL_ROLES, batch_get_user_lite, get_government_by_country_id, batch_get_government_by_country_ids
+from warera_api import get_user_lite, get_government_role, get_government_role_from_govt_data, role_display_name, get_country_by_id, LOCAL_ROLES, batch_get_user_lite, get_government_by_country_id, batch_get_government_by_country_ids
 
 log = logging.getLogger(__name__)
-
-CONGO_COUNTRY_ID = '6873d0ea1758b40e712b5f4c'
 
 
 class SchedulerCog(commands.Cog, name='SchedulerCog'):
@@ -247,8 +245,8 @@ class SchedulerCog(commands.Cog, name='SchedulerCog'):
         await self._revoke_write_role_if_held(guild, member, str(member.id))
         # Revoke any write grants they made
         await self._revoke_grants_by_grantor(guild, str(member.id))
-        # Strip any local Congolese government roles
-        for _, db_key, _ in CONGO_LOCAL_ROLES:
+        # Strip any local government roles
+        for _, db_key, _ in LOCAL_ROLES:
             role_id = config.get(db_key) if config else None
             if role_id:
                 gov_role = guild.get_role(int(role_id))
@@ -279,8 +277,10 @@ class SchedulerCog(commands.Cog, name='SchedulerCog'):
         )
 
         try:
+            cfg = await self.bot.db.get_guild_config(str(guild.id)) or {}
+            server_name = cfg.get('home_country_name') or guild.name
             await member.send(
-                '⚠️ Your role in the **Congo Discord** has been changed to **Visitor** '
+                f'⚠️ Your role in the **{server_name} Discord** has been changed to **Visitor** '
                 'because you no longer meet the requirements for your previous role.'
             )
         except discord.Forbidden:
@@ -397,6 +397,7 @@ class SchedulerCog(commands.Cog, name='SchedulerCog'):
     async def _run_audit(self, guild: discord.Guild):
         """Core of the daily role audit — usable by the scheduler and admin commands."""
         config = await self.bot.db.get_guild_config(str(guild.id))
+        home_country_id = (config or {}).get('home_country_id') or ''
         tracked = await self.bot.db.get_all_tracked_users(str(guild.id))
         log.info(f'Role audit: checking {len(tracked)} tracked users')
 
@@ -405,18 +406,18 @@ class SchedulerCog(commands.Cog, name='SchedulerCog'):
         warera_results = await batch_get_user_lite(all_warera_ids)
         warera_map = {uid: data for uid, data in zip(all_warera_ids, warera_results) if data}
 
-        # Pre-fetch Congo government data once for the entire audit run
-        congo_govt = await get_government_by_country_id(CONGO_COUNTRY_ID)
+        # Pre-fetch home-country government data once for the entire audit run
+        congo_govt = await get_government_by_country_id(home_country_id)
 
         # Pre-fetch government data for all foreign countries with embassy members
         embassy_country_ids = list({
             t.get('country_id') for t in tracked
             if t.get('assigned_role') == 'embassy' and t.get('country_id')
-        } - {CONGO_COUNTRY_ID})
+        } - {home_country_id})
         extra_govts = await batch_get_government_by_country_ids(embassy_country_ids)
         govt_by_country = {**extra_govts}
         if congo_govt:
-            govt_by_country[CONGO_COUNTRY_ID] = congo_govt
+            govt_by_country[home_country_id] = congo_govt
 
         for t in tracked:
             member = guild.get_member(int(t['discord_id']))
@@ -430,13 +431,13 @@ class SchedulerCog(commands.Cog, name='SchedulerCog'):
             assigned = t.get('assigned_role')
 
             if assigned == 'citizen':
-                if warera_data.get('country') != CONGO_COUNTRY_ID:
-                    log.info(f'Downgrading {member} from citizen (no longer Congo)')
+                if home_country_id and warera_data.get('country') != home_country_id:
+                    log.info(f'Downgrading {member} from citizen (no longer home country)')
                     await self._downgrade_to_visitor(guild, member, t, config, warera_data)
                 else:
                     onboarding = self._get_onboarding()
                     if onboarding:
-                        await onboarding.sync_congo_local_roles(guild, member, warera_data, config, govt_data=congo_govt)
+                        await onboarding.sync_local_roles(guild, member, warera_data, config, govt_data=congo_govt)
 
             elif assigned == 'visitor':
                 current_country = warera_data.get('country')
@@ -454,16 +455,16 @@ class SchedulerCog(commands.Cog, name='SchedulerCog'):
                     infos = warera_data.get('infos', {})
                     role_field, access_level, _ = get_government_role(infos)
 
-                # Sync Congo local government roles for visitors who are Congo citizens
-                if current_country == CONGO_COUNTRY_ID:
+                # Sync local government roles for visitors who are home-country citizens
+                if current_country == home_country_id:
                     onboarding = self._get_onboarding()
                     if onboarding:
-                        await onboarding.sync_congo_local_roles(
+                        await onboarding.sync_local_roles(
                             guild, member, warera_data, config, govt_data=congo_govt
                         )
 
                 if role_field and access_level:
-                    if (current_country and current_country != CONGO_COUNTRY_ID
+                    if (current_country and current_country != home_country_id
                             and t.get('country_id') == current_country):
                         # Was previously an embassy member for this country — re-promote
                         log.info('Re-promoting %s from visitor to embassy (role detected)', member)
@@ -471,7 +472,7 @@ class SchedulerCog(commands.Cog, name='SchedulerCog'):
                             guild, member, t, config, warera_data,
                             current_country, access_level, role_field
                         )
-                    elif current_country != CONGO_COUNTRY_ID:
+                    elif current_country != home_country_id:
                         await self._notify_upgrade_available(member, role_field)
 
             elif assigned == 'embassy':
@@ -486,7 +487,7 @@ class SchedulerCog(commands.Cog, name='SchedulerCog'):
                     user_warera_id, current_country, member_govt
                 )
                 country_changed = bool(current_country and current_country != t.get('country_id'))
-                if current_country == CONGO_COUNTRY_ID:
+                if current_country == home_country_id:
                     citizen_role_id = config.get('citizen_role_id') if config else None
                     if citizen_role_id:
                         citizen_role = guild.get_role(int(citizen_role_id))
@@ -497,7 +498,7 @@ class SchedulerCog(commands.Cog, name='SchedulerCog'):
                                 pass
                     onboarding = self._get_onboarding()
                     if onboarding:
-                        await onboarding.sync_congo_local_roles(guild, member, warera_data, config, govt_data=congo_govt)
+                        await onboarding.sync_local_roles(guild, member, warera_data, config, govt_data=congo_govt)
                 if not role_field:
                     log.info(f'Downgrading {member} from embassy (lost government role)')
                     await self._downgrade_to_visitor(guild, member, t, config, warera_data)

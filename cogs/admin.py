@@ -18,12 +18,68 @@ import json
 import re as _re
 
 from country_flags import get_flag, country_channel_name
-from warera_api import get_user_lite, get_government_role, get_country_by_id, extract_user_id, CONGO_LOCAL_ROLES, CONGO_COUNTRY_ID, set_api_key, batch_get_user_lite, get_government_by_country_id, get_users_by_country, classify_player_build
+from warera_api import get_user_lite, get_government_role, get_country_by_id, extract_user_id, LOCAL_ROLES, set_api_key, batch_get_user_lite, get_government_by_country_id, get_users_by_country, classify_player_build
 
 log = logging.getLogger(__name__)
 
 
 # ── Setup wizard views ────────────────────────────────────────────────────────
+
+class SetupCountryModal(discord.ui.Modal, title='Home Country Setup'):
+    country_id = discord.ui.TextInput(
+        label='WarEra Country ID (24-char hex)',
+        placeholder='e.g. 6873d0ea1758b40e712b5f4c',
+        required=True,
+        min_length=24,
+        max_length=24,
+    )
+
+    def __init__(self, bot):
+        super().__init__()
+        self.bot = bot
+
+    async def on_submit(self, interaction: discord.Interaction):
+        cid = str(self.country_id.value).strip()
+        country_data = await get_country_by_id(cid)
+        if not country_data:
+            await interaction.response.edit_message(
+                content='❌ Country not found in WarEra. Check the ID and try again.',
+                view=None
+            )
+            return
+        name = country_data.get('name', cid)
+        flag = get_flag(country_data.get('name', ''))
+        await self.bot.db.set_guild_config(
+            str(interaction.guild_id),
+            home_country_id=cid, home_country_name=name, home_country_flag=flag
+        )
+        await interaction.response.edit_message(
+            content=f'✅ Home country set to **{name} {flag}** (`{cid}`).', view=None
+        )
+
+
+class SetupCountryButton(discord.ui.View):
+    def __init__(self, bot, user_id: int):
+        super().__init__(timeout=120)
+        self.bot = bot
+        self.user_id = user_id
+
+    @discord.ui.button(label='Enter Country ID', style=discord.ButtonStyle.primary, emoji='🌍')
+    async def enter(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if interaction.user.id != self.user_id:
+            await interaction.response.send_message('Not your setup.', ephemeral=True)
+            return
+        await interaction.response.send_modal(SetupCountryModal(self.bot))
+
+    @discord.ui.button(label='Skip', style=discord.ButtonStyle.secondary)
+    async def skip(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if interaction.user.id != self.user_id:
+            await interaction.response.send_message('Not your setup.', ephemeral=True)
+            return
+        for item in self.children:
+            item.disabled = True
+        await interaction.response.edit_message(content='⏭️ Home country step skipped.', view=self)
+
 
 class SetupCategorySelect(discord.ui.View):
     def __init__(self, bot, user_id: int, step: str, categories: list):
@@ -300,32 +356,47 @@ class AdminCog(commands.Cog, name='AdminCog'):
 
     # ── /setup ────────────────────────────────────────────────────────────────
 
-    @app_commands.command(name='setup', description='Configure the Congo bot (admin only).')
+    @app_commands.command(name='setup', description='Configure the bot (admin only).')
     @app_commands.default_permissions(administrator=True)
     async def setup(self, interaction: discord.Interaction):
         guild = interaction.guild
         categories = [c for c in guild.categories]
         roles = [r for r in guild.roles if not r.is_default() and not r.managed]
 
-        total_steps = 9 + len(CONGO_LOCAL_ROLES)
+        config = await self.bot.db.get_guild_config(str(guild.id)) or {}
+        country_name = config.get('home_country_name') or 'your country'
+        cur_country = (
+            f'{config["home_country_name"]} {config.get("home_country_flag", "")}'.strip()
+            if config.get('home_country_name') else '*(not set)*'
+        )
+        total_steps = 10 + len(LOCAL_ROLES)
+
+        # Step 1: Home country ID
         await interaction.response.send_message(
-            f'**Congo Bot Setup — Step 1/{total_steps}**\nSelect the category where **onboarding channels** will be created:',
-            view=SetupCategorySelect(self.bot, interaction.user.id, 'onboarding', categories),
+            f'**Bot Setup — Step 1/{total_steps}** — Set your **home WarEra country** '
+            f'(used for citizen verification and government role sync).\n'
+            f'Current: {cur_country}',
+            view=SetupCountryButton(self.bot, interaction.user.id),
             ephemeral=True
         )
+
         # Show a summary of current config
-        config = await self.bot.db.get_guild_config(str(guild.id))
         if config:
             lines = []
             for key, label in [
+                ('home_country_name',      'Home country'),
                 ('onboarding_category_id', 'Onboarding category'),
-                ('embassy_category_id', 'Embassy category'),
-                ('senate_role_id', 'Senate role'),
-                ('visitor_role_id', 'Visitor role'),
-                ('citizen_role_id', 'Citizen role'),
-            ] + [(db_key, f'Congo {name}') for _, db_key, name in CONGO_LOCAL_ROLES]:
+                ('embassy_category_id',    'Embassy category'),
+                ('senate_role_id',         'Senate role'),
+                ('visitor_role_id',        'Visitor role'),
+                ('citizen_role_id',        'Citizen role'),
+            ] + [(db_key, f'{country_name} {name}') for _, db_key, name in LOCAL_ROLES]:
                 val = config.get(key)
-                if val:
+                if key == 'home_country_name':
+                    flag = config.get('home_country_flag', '')
+                    display = f'{val} {flag}'.strip() if val else None
+                    lines.append(f'{"✅" if display else "❌"} {label}: **{display}**' if display else f'❌ {label}: *not set*')
+                elif val:
                     obj = guild.get_channel(int(val)) or guild.get_role(int(val))
                     lines.append(f'✅ {label}: **{obj.name if obj else val}**')
                 else:
@@ -333,30 +404,35 @@ class AdminCog(commands.Cog, name='AdminCog'):
             await interaction.followup.send('\n'.join(lines), ephemeral=True)
 
         await interaction.followup.send(
-            f'**Step 2/{total_steps}** — Select the **Embassy category** (or create one):',
+            f'**Step 2/{total_steps}** — Select the category where **onboarding channels** will be created:',
+            view=SetupCategorySelect(self.bot, interaction.user.id, 'onboarding', categories),
+            ephemeral=True
+        )
+        await interaction.followup.send(
+            f'**Step 3/{total_steps}** — Select the **Embassy category** (or create one):',
             view=SetupCategorySelect(self.bot, interaction.user.id, 'embassy', categories),
             ephemeral=True
         )
         await interaction.followup.send(
-            f'**Step 3/{total_steps}** — Select the **Senate role** (existing only):',
+            f'**Step 4/{total_steps}** — Select the **Senate role** (existing only):',
             view=SetupRoleSelect(self.bot, interaction.user.id, 'senate', roles),
             ephemeral=True
         )
         await interaction.followup.send(
-            f'**Step 4/{total_steps}** — Select or create the **Visitor role**:',
+            f'**Step 5/{total_steps}** — Select or create the **Visitor role**:',
             view=SetupRoleSelect(self.bot, interaction.user.id, 'visitor', roles),
             ephemeral=True
         )
         await interaction.followup.send(
-            f'**Step 5/{total_steps}** — Select or create the **Citizen role**:',
+            f'**Step 6/{total_steps}** — Select or create the **Citizen role**:',
             view=SetupRoleSelect(self.bot, interaction.user.id, 'citizen', roles),
             ephemeral=True
         )
-        # Steps 6–11: Congolese government roles (local Discord roles for citizens)
-        for i, (_, db_key, display_name) in enumerate(CONGO_LOCAL_ROLES, start=6):
+        # Steps 7–12: home-country government roles (local Discord roles for citizens)
+        for i, (_, db_key, display_name) in enumerate(LOCAL_ROLES, start=7):
             await interaction.followup.send(
                 f'**Step {i}/{total_steps}** — Select or create the **{display_name}** role '
-                f'(local Congo government role):',
+                f'(local {country_name} government role):',
                 view=SetupRoleSelect(
                     self.bot, interaction.user.id, display_name, roles,
                     db_key=db_key, can_create=True
@@ -374,7 +450,7 @@ class AdminCog(commands.Cog, name='AdminCog'):
             ephemeral=True
         )
         # Optional WarEra API key (doubles rate limit to 200 req/min)
-        api_key_set = bool((await self.bot.db.get_guild_config(str(guild.id)) or {}).get('warera_api_key'))
+        api_key_set = bool(config.get('warera_api_key'))
         await interaction.followup.send(
             f'**Step {total_steps - 2}/{total_steps}** — (Optional) Set your **WarEra API key** '
             f'to raise the rate limit from 100 to **200 requests/min**.\n'
@@ -391,8 +467,7 @@ class AdminCog(commands.Cog, name='AdminCog'):
             ephemeral=True
         )
         # Eco/war alert threshold
-        cur_config = await self.bot.db.get_guild_config(str(guild.id)) or {}
-        cur_threshold = cur_config.get('eco_war_threshold') or 20
+        cur_threshold = config.get('eco_war_threshold') or 20
         await interaction.followup.send(
             f'**Step {total_steps}/{total_steps}** — (Optional) Set the **eco/war alert threshold** '
             f'(% of active players that must shift to trigger an alert).\n'
@@ -410,6 +485,9 @@ class AdminCog(commands.Cog, name='AdminCog'):
         config = await self.bot.db.get_guild_config(str(guild.id)) or {}
 
         fields = [
+            ('home_country_id',              'SETUP_HOME_COUNTRY_ID'),
+            ('home_country_name',            '# auto-fetched name'),
+            ('home_country_flag',            '# auto-fetched flag'),
             ('onboarding_category_id',       'SETUP_ONBOARDING_CATEGORY_ID'),
             ('embassy_category_id',          'SETUP_EMBASSY_CATEGORY_ID'),
             ('senate_role_id',               'SETUP_SENATE_ROLE_ID'),
@@ -422,8 +500,8 @@ class AdminCog(commands.Cog, name='AdminCog'):
             ('local_role_defense_id',        'SETUP_LOCAL_ROLE_DEFENSE_ID'),
             ('local_role_congress_id',       'SETUP_LOCAL_ROLE_CONGRESS_ID'),
             ('elders_role_id',               'SETUP_ELDERS_ROLE_ID'),
-            ('eco_war_alert_channel_id',      'SETUP_ECO_WAR_ALERT_CHANNEL_ID'),
-            ('eco_war_threshold',             'SETUP_ECO_WAR_THRESHOLD'),
+            ('eco_war_alert_channel_id',     'SETUP_ECO_WAR_ALERT_CHANNEL_ID'),
+            ('eco_war_threshold',            'SETUP_ECO_WAR_THRESHOLD'),
         ]
 
         lines = ['**Current guild config** (copy IDs into `.env` to survive database resets)\n```']
@@ -637,12 +715,15 @@ class AdminCog(commands.Cog, name='AdminCog'):
 
         # Force warera_id and username if missing
         if not request.get('warera_id'):
+            test_cfg = await self.bot.db.get_guild_config(str(guild.id)) or {}
+            test_country_id   = test_cfg.get('home_country_id')   or '6873d0ea1758b40e712b5f4c'
+            test_country_name = test_cfg.get('home_country_name') or 'Congo'
             await self.bot.db.update_user_request(
                 str(user.id), str(interaction.guild.id),
                 warera_id='test000000000000test0000',
                 warera_username=user.name,
-                country_id='6873d0ea1758b40e712b5f4c',
-                country_name='Congo',
+                country_id=test_country_id,
+                country_name=test_country_name,
                 verification_token='TESTTOKEN',
                 requested_role='citizen',
                 status='awaiting_company_change'
@@ -674,10 +755,14 @@ class AdminCog(commands.Cog, name='AdminCog'):
 
         # Ensure an embassy_request record exists for the test
         emb = await self.bot.db.get_embassy_request(str(user.id), str(interaction.guild.id))
+        test_cfg      = await self.bot.db.get_guild_config(str(interaction.guild.id)) or {}
+        test_cid      = test_cfg.get('home_country_id')   or '6873d0ea1758b40e712b5f4c'
+        test_cname    = test_cfg.get('home_country_name') or 'Congo'
+        test_cflag    = test_cfg.get('home_country_flag') or '🇨🇬'
         if not emb:
             await self.bot.db.create_embassy_request(
                 str(user.id), str(interaction.guild.id),
-                '6873d0ea1758b40e712b5f4c', 'Congo', '🇨🇬',
+                test_cid, test_cname, test_cflag,
                 'presidentOf', 'write'
             )
         if not request.get('warera_id'):
@@ -685,8 +770,8 @@ class AdminCog(commands.Cog, name='AdminCog'):
                 str(user.id), str(interaction.guild.id),
                 warera_id='test000000000000test0000',
                 warera_username=user.name,
-                country_id='6873d0ea1758b40e712b5f4c',
-                country_name='Congo',
+                country_id=test_cid,
+                country_name=test_cname,
                 verification_token='TESTTOKEN',
                 requested_role='embassy',
                 status='awaiting_company_change'
@@ -960,7 +1045,7 @@ class AdminCog(commands.Cog, name='AdminCog'):
 
     @app_commands.command(
         name='admin-restore-localroles',
-        description='[Admin] Re-link all citizens to their correct Congolese government Discord roles.'
+        description='[Admin] Re-link all citizens to their correct home-country government Discord roles.'
     )
     @app_commands.default_permissions(administrator=True)
     async def admin_restore_localroles(self, interaction: discord.Interaction):
@@ -975,11 +1060,11 @@ class AdminCog(commands.Cog, name='AdminCog'):
             await interaction.followup.send('Bot is not configured — run `/setup` first.', ephemeral=True)
             return
 
-        # Check that at least one local Congo role is configured
-        configured = [db_key for _, db_key, _ in CONGO_LOCAL_ROLES if config.get(db_key)]
+        # Check that at least one local government role is configured
+        configured = [db_key for _, db_key, _ in LOCAL_ROLES if config.get(db_key)]
         if not configured:
             await interaction.followup.send(
-                '⚠️ No Congolese government roles are configured yet. '
+                '⚠️ No home-country government roles are configured yet. '
                 'Run `/setup` and assign the President, Vice President, etc. roles first.',
                 ephemeral=True
             )
@@ -990,10 +1075,11 @@ class AdminCog(commands.Cog, name='AdminCog'):
             await interaction.followup.send('OnboardingCog not loaded.', ephemeral=True)
             return
 
+        home_country_id = config.get('home_country_id') or ''
         tracked = await self.bot.db.get_all_tracked_users(str(guild.id))
-        # Process citizens, embassy members, and visitors — sync_congo_local_roles checks
-        # Congo country ID per role, so it's a no-op for non-Congolese members.
-        # Visitors who are Congo citizens/government officials also need syncing.
+        # Process citizens, embassy members, and visitors — sync_local_roles checks
+        # the home country ID per role, so it's a no-op for members from other countries.
+        # Visitors who are home-country citizens/government officials also need syncing.
         eligible = [
             t for t in tracked
             if t.get('assigned_role') in ('citizen', 'embassy', 'visitor')
@@ -1009,8 +1095,8 @@ class AdminCog(commands.Cog, name='AdminCog'):
         warera_results = await batch_get_user_lite(eligible_ids)
         warera_map = {uid: data for uid, data in zip(eligible_ids, warera_results) if data}
 
-        # Pre-fetch Congo government data once for all members in this run
-        congo_govt = await get_government_by_country_id(CONGO_COUNTRY_ID)
+        # Pre-fetch home-country government data once for all members in this run
+        congo_govt = await get_government_by_country_id(home_country_id)
 
         updated, errors = 0, 0
         detail_lines: list[str] = []
@@ -1024,12 +1110,12 @@ class AdminCog(commands.Cog, name='AdminCog'):
                 api_failed.add(str(t['discord_id']))
                 continue
 
-            # Skip visitors who are not Congo citizens — nothing to sync for them
-            if t.get('assigned_role') == 'visitor' and warera_data.get('country') != CONGO_COUNTRY_ID:
+            # Skip visitors who are not home-country citizens — nothing to sync for them
+            if t.get('assigned_role') == 'visitor' and warera_data.get('country') != home_country_id:
                 continue
 
-            # Congolese embassy members also get the Citizen role — check live WarEra data
-            if t.get('assigned_role') == 'embassy' and warera_data.get('country') == CONGO_COUNTRY_ID:
+            # Home-country embassy members also get the Citizen role — check live WarEra data
+            if t.get('assigned_role') == 'embassy' and warera_data.get('country') == home_country_id:
                 citizen_role_id = config.get('citizen_role_id')
                 if citizen_role_id:
                     citizen_role = guild.get_role(int(citizen_role_id))
@@ -1039,7 +1125,7 @@ class AdminCog(commands.Cog, name='AdminCog'):
                         except discord.Forbidden:
                             pass
 
-            added, removed_from_member, add_err, rem_err = await onboarding.sync_congo_local_roles(
+            added, removed_from_member, add_err, rem_err = await onboarding.sync_local_roles(
                 guild, member, warera_data, config, govt_data=congo_govt
             )
             updated += 1
@@ -1064,10 +1150,10 @@ class AdminCog(commands.Cog, name='AdminCog'):
                 )
 
             # Record which roles this member legitimately holds (use government endpoint
-            # data — CONGO_LOCAL_ROLES uses government field names, not getUserLite.infos)
+            # data — LOCAL_ROLES uses government field names, not getUserLite.infos)
             user_id = warera_data.get('_id', '')
             if user_id and congo_govt:
-                for gf, db_key, _ in CONGO_LOCAL_ROLES:
+                for gf, db_key, _ in LOCAL_ROLES:
                     val = congo_govt.get(gf)
                     if val is None:
                         continue
@@ -1081,7 +1167,7 @@ class AdminCog(commands.Cog, name='AdminCog'):
         # when we can't verify membership.
         removed = 0
         if congo_govt is not None:
-            for _, db_key, display_name in CONGO_LOCAL_ROLES:
+            for _, db_key, display_name in LOCAL_ROLES:
                 role_id = config.get(db_key)
                 if not role_id:
                     continue
@@ -1096,13 +1182,14 @@ class AdminCog(commands.Cog, name='AdminCog'):
                         continue
                     try:
                         await m.remove_roles(
-                            discord_role, reason=f'Local role audit: does not qualify for Congo {display_name}'
+                            discord_role, reason=f'Local role audit: does not qualify for {display_name}'
                         )
                         removed += 1
                     except Exception as e:
                         detail_lines.append(f'⚠️ {m.mention}: failed to remove `{discord_role.name}` — `{e}`')
 
-        parts = [f'✅ Synced Congolese government roles for **{updated}** member(s).']
+        country_label = config.get('home_country_name') or 'home country'
+        parts = [f'✅ Synced {country_label} government roles for **{updated}** member(s).']
         if removed:
             parts.append(f'🗑️ Removed unqualified assignments from **{removed}** member(s).')
         if errors:
@@ -1150,16 +1237,17 @@ class AdminCog(commands.Cog, name='AdminCog'):
             await interaction.followup.send('\n'.join(lines), ephemeral=True)
             return
 
+        home_cid = config.get('home_country_id') or '(not configured)'
         lines.append(
             f'**WarEra country:** `{warera_data.get("country")}`  '
-            f'(Congo = `{CONGO_COUNTRY_ID}`)'
+            f'(home country = `{home_cid}`)'
         )
         infos = warera_data.get('infos') or {}
         lines.append(f'**WarEra infos:** `{infos}`')
 
-        # Per-role diagnosis — fetch government API (same source as sync_congo_local_roles)
+        # Per-role diagnosis — fetch government API (same source as sync_local_roles)
         warera_id = warera_data.get('_id', '')
-        congo_govt = await get_government_by_country_id(CONGO_COUNTRY_ID)
+        congo_govt = await get_government_by_country_id(config.get('home_country_id') or '')
         if congo_govt is None:
             lines.append('\n⚠️ **Government API unavailable** — role check below uses user infos only (may be inaccurate)')
 
@@ -1173,7 +1261,7 @@ class AdminCog(commands.Cog, name='AdminCog'):
         }
 
         lines.append('\n**Local role check:**')
-        for warera_field, db_key, display_name in CONGO_LOCAL_ROLES:
+        for warera_field, db_key, display_name in LOCAL_ROLES:
             role_id = config.get(db_key)
             if not role_id:
                 lines.append(f'  ⚙️ **{display_name}**: not configured in /setup')
@@ -1183,7 +1271,7 @@ class AdminCog(commands.Cog, name='AdminCog'):
                 lines.append(f'  ⚠️ **{display_name}**: role ID `{role_id}` no longer exists in Discord')
                 continue
 
-            # Check via government API (matches sync_congo_local_roles logic)
+            # Check via government API (matches sync_local_roles logic)
             govt_val = (congo_govt or {}).get(warera_field)
             if isinstance(govt_val, list):
                 has_warera_role = bool(warera_id) and warera_id in govt_val
@@ -1727,9 +1815,9 @@ class AdminCog(commands.Cog, name='AdminCog'):
         onboarding_cat_id = config.get('onboarding_category_id')
         onboarding_cat = guild.get_channel(int(onboarding_cat_id)) if onboarding_cat_id else None
 
-        # Collect Congo local role IDs for roles_to_remove on failure
+        # Collect local government role IDs for roles_to_remove on failure
         local_role_ids = []
-        for _, db_key, _ in CONGO_LOCAL_ROLES:
+        for _, db_key, _ in LOCAL_ROLES:
             rid = config.get(db_key)
             if rid:
                 local_role_ids.append(rid)
@@ -1756,7 +1844,7 @@ class AdminCog(commands.Cog, name='AdminCog'):
                 skipped += 1
                 continue
 
-            # Collect which local Congo roles this member currently holds
+            # Collect which local government roles this member currently holds
             roles_to_remove = [
                 rid for rid in local_role_ids
                 if guild.get_role(int(rid)) in member.roles
